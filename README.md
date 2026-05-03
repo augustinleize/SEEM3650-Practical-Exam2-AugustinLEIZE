@@ -1,1 +1,0 @@
-# SEEM3650-Practical-Exam2-AugustinLEIZE
