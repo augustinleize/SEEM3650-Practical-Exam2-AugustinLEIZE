@@ -1,0 +1,4108 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+import typing as t
+from datetime import datetime
+from functools import cache
+from functools import update_wrapper
+from types import TracebackType
+
+import werkzeug.utils
+from werkzeug.exceptions import abort as _wz_abort
+from werkzeug.utils import redirect as _wz_redirect
+from werkzeug.wrappers import Response as BaseResponse
+
+from .globals import _cv_app
+from .globals import app_ctx
+from .globals import current_app
+from .globals import request
+from .globals import session
+from .signals import message_flashed
+
+if t.TYPE_CHECKING:  # pragma: no cover
+    from .wrappers import Response
+
+
+def get_debug_flag() -> bool:
+    """Get whether debug mode should be enabled for the app, indicated by the
+    :envvar:`FLASK_DEBUG` environment variable. The default is ``False``.
+    """
+    val = os.environ.get("FLASK_DEBUG")
+    return bool(val and val.lower() not in {"0", "false", "no"})
+
+
+def get_load_dotenv(default: bool = True) -> bool:
+    """Get whether the user has disabled loading default dotenv files by
+    setting :envvar:`FLASK_SKIP_DOTENV`. The default is ``True``, load
+    the files.
+
+    :param default: What to return if the env var isn't set.
+    """
+    val = os.environ.get("FLASK_SKIP_DOTENV")
+
+    if not val:
+        return default
+
+    return val.lower() in ("0", "false", "no")
+
+
+@t.overload
+def stream_with_context(
+    generator_or_function: t.Iterator[t.AnyStr],
+) -> t.Iterator[t.AnyStr]: ...
+
+
+@t.overload
+def stream_with_context(
+    generator_or_function: t.Callable[..., t.Iterator[t.AnyStr]],
+) -> t.Callable[[t.Iterator[t.AnyStr]], t.Iterator[t.AnyStr]]: ...
+
+
+def stream_with_context(
+    generator_or_function: t.Iterator[t.AnyStr] | t.Callable[..., t.Iterator[t.AnyStr]],
+) -> t.Iterator[t.AnyStr] | t.Callable[[t.Iterator[t.AnyStr]], t.Iterator[t.AnyStr]]:
+    """Wrap a response generator function so that it runs inside the current
+    request context. This keeps :data:`.request`, :data:`.session`, and :data:`.g`
+    available, even though at the point the generator runs the request context
+    will typically have ended.
+
+    .. warning::
+
+        Due to the following caveat, it is often safer to pass the data you
+        need as arguments to the generator, rather than relying on the context
+        objects.
+
+    More headers cannot be sent after the body has begun. Therefore, you must
+    make sure all headers are set before starting the response. In particular,
+    if the generator will access ``session``, be sure to do so in the view as
+    well so that the ``Vary: cookie`` header will be set. Do not modify the
+    session in the generator, as the ``Set-Cookie`` header will already be sent.
+
+    Use it as a decorator on a generator function:
+
+    .. code-block:: python
+
+        from flask import stream_with_context, request, Response
+
+        @app.get("/stream")
+        def streamed_response():
+            @stream_with_context
+            def generate():
+                yield "Hello "
+                yield request.args["name"]
+                yield "!"
+
+            return Response(generate())
+
+    Or use it as a wrapper around a created generator:
+
+    .. code-block:: python
+
+        from flask import stream_with_context, request, Response
+
+        @app.get("/stream")
+        def streamed_response():
+            def generate():
+                yield "Hello "
+                yield request.args["name"]
+                yield "!"
+
+            return Response(stream_with_context(generate()))
+
+    .. versionadded:: 0.9
+    """
+    try:
+        gen = iter(generator_or_function)  # type: ignore[arg-type]
+    except TypeError:
+
+        def decorator(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            gen = generator_or_function(*args, **kwargs)  # type: ignore[operator]
+            return stream_with_context(gen)
+
+        return update_wrapper(decorator, generator_or_function)  # type: ignore[arg-type]
+
+    def generator() -> t.Iterator[t.AnyStr]:
+        if (ctx := _cv_app.get(None)) is None:
+            raise RuntimeError(
+                "'stream_with_context' can only be used when a request"
+                " context is active, such as in a view function."
+            )
+
+        with ctx:
+            yield None  # type: ignore[misc]
+
+            try:
+                yield from gen
+            finally:
+                # Clean up in case the user wrapped a WSGI iterator.
+                if hasattr(gen, "close"):
+                    gen.close()
+
+    # Execute the generator to the sentinel value. This captures the current
+    # context and pushes it to preserve it. Further iteration will yield from
+    # the original iterator.
+    wrapped_g = generator()
+    next(wrapped_g)
+    return wrapped_g
+
+
+def make_response(*args: t.Any) -> Response:
+    """Sometimes it is necessary to set additional headers in a view.  Because
+    views do not have to return response objects but can return a value that
+    is converted into a response object by Flask itself, it becomes tricky to
+    add headers to it.  This function can be called instead of using a return
+    and you will get a response object which you can use to attach headers.
+
+    If view looked like this and you want to add a new header::
+
+        def index():
+            return render_template('index.html', foo=42)
+
+    You can now do something like this::
+
+        def index():
+            response = make_response(render_template('index.html', foo=42))
+            response.headers['X-Parachutes'] = 'parachutes are cool'
+            return response
+
+    This function accepts the very same arguments you can return from a
+    view function.  This for example creates a response with a 404 error
+    code::
+
+        response = make_response(render_template('not_found.html'), 404)
+
+    The other use case of this function is to force the return value of a
+    view function into a response which is helpful with view
+    decorators::
+
+        response = make_response(view_function())
+        response.headers['X-Parachutes'] = 'parachutes are cool'
+
+    Internally this function does the following things:
+
+    -   if no arguments are passed, it creates a new response argument
+    -   if one argument is passed, :meth:`flask.Flask.make_response`
+        is invoked with it.
+    -   if more than one argument is passed, the arguments are passed
+        to the :meth:`flask.Flask.make_response` function as tuple.
+
+    .. versionadded:: 0.6
+    """
+    if not args:
+        return current_app.response_class()
+    if len(args) == 1:
+        args = args[0]
+    return current_app.make_response(args)
+
+
+def url_for(
+    endpoint: str,
+    *,
+    _anchor: str | None = None,
+    _method: str | None = None,
+    _scheme: str | None = None,
+    _external: bool | None = None,
+    **values: t.Any,
+) -> str:
+    """Generate a URL to the given endpoint with the given values.
+
+    This requires an active request or application context, and calls
+    :meth:`current_app.url_for() <flask.Flask.url_for>`. See that method
+    for full documentation.
+
+    :param endpoint: The endpoint name associated with the URL to
+        generate. If this starts with a ``.``, the current blueprint
+        name (if any) will be used.
+    :param _anchor: If given, append this as ``#anchor`` to the URL.
+    :param _method: If given, generate the URL associated with this
+        method for the endpoint.
+    :param _scheme: If given, the URL will have this scheme if it is
+        external.
+    :param _external: If given, prefer the URL to be internal (False) or
+        require it to be external (True). External URLs include the
+        scheme and domain. When not in an active request, URLs are
+        external by default.
+    :param values: Values to use for the variable parts of the URL rule.
+        Unknown keys are appended as query string arguments, like
+        ``?a=b&c=d``.
+
+    .. versionchanged:: 2.2
+        Calls ``current_app.url_for``, allowing an app to override the
+        behavior.
+
+    .. versionchanged:: 0.10
+       The ``_scheme`` parameter was added.
+
+    .. versionchanged:: 0.9
+       The ``_anchor`` and ``_method`` parameters were added.
+
+    .. versionchanged:: 0.9
+       Calls ``app.handle_url_build_error`` on build errors.
+    """
+    return current_app.url_for(
+        endpoint,
+        _anchor=_anchor,
+        _method=_method,
+        _scheme=_scheme,
+        _external=_external,
+        **values,
+    )
+
+
+def redirect(
+    location: str, code: int = 303, Response: type[BaseResponse] | None = None
+) -> BaseResponse:
+    """Create a redirect response object.
+
+    If :data:`~flask.current_app` is available, it will use its
+    :meth:`~flask.Flask.redirect` method, otherwise it will use
+    :func:`werkzeug.utils.redirect`.
+
+    :param location: The URL to redirect to.
+    :param code: The status code for the redirect.
+    :param Response: The response class to use. Not used when
+        ``current_app`` is active, which uses ``app.response_class``.
+
+    .. versionchanged:: 3.2
+        ``code`` defaults to ``303`` instead of ``302``.
+
+    .. versionadded:: 2.2
+        Calls ``current_app.redirect`` if available instead of always
+        using Werkzeug's default ``redirect``.
+    """
+    if (ctx := _cv_app.get(None)) is not None:
+        return ctx.app.redirect(location, code=code)
+
+    return _wz_redirect(location, code=code, Response=Response)
+
+
+def abort(code: int | BaseResponse, *args: t.Any, **kwargs: t.Any) -> t.NoReturn:
+    """Raise an :exc:`~werkzeug.exceptions.HTTPException` for the given
+    status code.
+
+    If :data:`~flask.current_app` is available, it will call its
+    :attr:`~flask.Flask.aborter` object, otherwise it will use
+    :func:`werkzeug.exceptions.abort`.
+
+    :param code: The status code for the exception, which must be
+        registered in ``app.aborter``.
+    :param args: Passed to the exception.
+    :param kwargs: Passed to the exception.
+
+    .. versionadded:: 2.2
+        Calls ``current_app.aborter`` if available instead of always
+        using Werkzeug's default ``abort``.
+    """
+    if (ctx := _cv_app.get(None)) is not None:
+        ctx.app.aborter(code, *args, **kwargs)
+
+    _wz_abort(code, *args, **kwargs)
+
+
+def get_template_attribute(template_name: str, attribute: str) -> t.Any:
+    """Loads a macro (or variable) a template exports.  This can be used to
+    invoke a macro from within Python code.  If you for example have a
+    template named :file:`_cider.html` with the following contents:
+
+    .. sourcecode:: html+jinja
+
+       {% macro hello(name) %}Hello {{ name }}!{% endmacro %}
+
+    You can access this from Python code like this::
+
+        hello = get_template_attribute('_cider.html', 'hello')
+        return hello('World')
+
+    .. versionadded:: 0.2
+
+    :param template_name: the name of the template
+    :param attribute: the name of the variable of macro to access
+    """
+    return getattr(current_app.jinja_env.get_template(template_name).module, attribute)
+
+
+def flash(message: str, category: str = "message") -> None:
+    """Flashes a message to the next request.  In order to remove the
+    flashed message from the session and to display it to the user,
+    the template has to call :func:`get_flashed_messages`.
+
+    .. versionchanged:: 0.3
+       `category` parameter added.
+
+    :param message: the message to be flashed.
+    :param category: the category for the message.  The following values
+                     are recommended: ``'message'`` for any kind of message,
+                     ``'error'`` for errors, ``'info'`` for information
+                     messages and ``'warning'`` for warnings.  However any
+                     kind of string can be used as category.
+    """
+    # Original implementation:
+    #
+    #     session.setdefault('_flashes', []).append((category, message))
+    #
+    # This assumed that changes made to mutable structures in the session are
+    # always in sync with the session object, which is not true for session
+    # implementations that use external storage for keeping their keys/values.
+    flashes = session.get("_flashes", [])
+    flashes.append((category, message))
+    session["_flashes"] = flashes
+    app = current_app._get_current_object()
+    message_flashed.send(
+        app,
+        _async_wrapper=app.ensure_sync,
+        message=message,
+        category=category,
+    )
+
+
+def get_flashed_messages(
+    with_categories: bool = False, category_filter: t.Iterable[str] = ()
+) -> list[str] | list[tuple[str, str]]:
+    """Pulls all flashed messages from the session and returns them.
+    Further calls in the same request to the function will return
+    the same messages.  By default just the messages are returned,
+    but when `with_categories` is set to ``True``, the return value will
+    be a list of tuples in the form ``(category, message)`` instead.
+
+    Filter the flashed messages to one or more categories by providing those
+    categories in `category_filter`.  This allows rendering categories in
+    separate html blocks.  The `with_categories` and `category_filter`
+    arguments are distinct:
+
+    * `with_categories` controls whether categories are returned with message
+      text (``True`` gives a tuple, where ``False`` gives just the message text).
+    * `category_filter` filters the messages down to only those matching the
+      provided categories.
+
+    See :doc:`/patterns/flashing` for examples.
+
+    .. versionchanged:: 0.3
+       `with_categories` parameter added.
+
+    .. versionchanged:: 0.9
+        `category_filter` parameter added.
+
+    :param with_categories: set to ``True`` to also receive categories.
+    :param category_filter: filter of categories to limit return values.  Only
+                            categories in the list will be returned.
+    """
+    flashes = app_ctx._flashes
+    if flashes is None:
+        flashes = session.pop("_flashes") if "_flashes" in session else []
+        app_ctx._flashes = flashes
+    if category_filter:
+        flashes = list(filter(lambda f: f[0] in category_filter, flashes))
+    if not with_categories:
+        return [x[1] for x in flashes]
+    return flashes
+
+
+def _prepare_send_file_kwargs(**kwargs: t.Any) -> dict[str, t.Any]:
+    ctx = app_ctx._get_current_object()
+
+    if kwargs.get("max_age") is None:
+        kwargs["max_age"] = ctx.app.get_send_file_max_age
+
+    kwargs.update(
+        environ=ctx.request.environ,
+        use_x_sendfile=ctx.app.config["USE_X_SENDFILE"],
+        response_class=ctx.app.response_class,
+        _root_path=ctx.app.root_path,
+    )
+    return kwargs
+
+
+def send_file(
+    path_or_file: os.PathLike[t.AnyStr] | str | t.IO[bytes],
+    mimetype: str | None = None,
+    as_attachment: bool = False,
+    download_name: str | None = None,
+    conditional: bool = True,
+    etag: bool | str = True,
+    last_modified: datetime | int | float | None = None,
+    max_age: None | (int | t.Callable[[str | None], int | None]) = None,
+) -> Response:
+    """Send the contents of a file to the client.
+
+    The first argument can be a file path or a file-like object. Paths
+    are preferred in most cases because Werkzeug can manage the file and
+    get extra information from the path. Passing a file-like object
+    requires that the file is opened in binary mode, and is mostly
+    useful when building a file in memory with :class:`io.BytesIO`.
+
+    Never pass file paths provided by a user. The path is assumed to be
+    trusted, so a user could craft a path to access a file you didn't
+    intend. Use :func:`send_from_directory` to safely serve
+    user-requested paths from within a directory.
+
+    If the WSGI server sets a ``file_wrapper`` in ``environ``, it is
+    used, otherwise Werkzeug's built-in wrapper is used. Alternatively,
+    if the HTTP server supports ``X-Sendfile``, configuring Flask with
+    ``USE_X_SENDFILE = True`` will tell the server to send the given
+    path, which is much more efficient than reading it in Python.
+
+    :param path_or_file: The path to the file to send, relative to the
+        current working directory if a relative path is given.
+        Alternatively, a file-like object opened in binary mode. Make
+        sure the file pointer is seeked to the start of the data.
+    :param mimetype: The MIME type to send for the file. If not
+        provided, it will try to detect it from the file name.
+    :param as_attachment: Indicate to a browser that it should offer to
+        save the file instead of displaying it.
+    :param download_name: The default name browsers will use when saving
+        the file. Defaults to the passed file name.
+    :param conditional: Enable conditional and range responses based on
+        request headers. Requires passing a file path and ``environ``.
+    :param etag: Calculate an ETag for the file, which requires passing
+        a file path. Can also be a string to use instead.
+    :param last_modified: The last modified time to send for the file,
+        in seconds. If not provided, it will try to detect it from the
+        file path.
+    :param max_age: How long the client should cache the file, in
+        seconds. If set, ``Cache-Control`` will be ``public``, otherwise
+        it will be ``no-cache`` to prefer conditional caching.
+
+    .. versionchanged:: 2.0
+        ``download_name`` replaces the ``attachment_filename``
+        parameter. If ``as_attachment=False``, it is passed with
+        ``Content-Disposition: inline`` instead.
+
+    .. versionchanged:: 2.0
+        ``max_age`` replaces the ``cache_timeout`` parameter.
+        ``conditional`` is enabled and ``max_age`` is not set by
+        default.
+
+    .. versionchanged:: 2.0
+        ``etag`` replaces the ``add_etags`` parameter. It can be a
+        string to use instead of generating one.
+
+    .. versionchanged:: 2.0
+        Passing a file-like object that inherits from
+        :class:`~io.TextIOBase` will raise a :exc:`ValueError` rather
+        than sending an empty file.
+
+    .. versionadded:: 2.0
+        Moved the implementation to Werkzeug. This is now a wrapper to
+        pass some Flask-specific arguments.
+
+    .. versionchanged:: 1.1
+        ``filename`` may be a :class:`~os.PathLike` object.
+
+    .. versionchanged:: 1.1
+        Passing a :class:`~io.BytesIO` object supports range requests.
+
+    .. versionchanged:: 1.0.3
+        Filenames are encoded with ASCII instead of Latin-1 for broader
+        compatibility with WSGI servers.
+
+    .. versionchanged:: 1.0
+        UTF-8 filenames as specified in :rfc:`2231` are supported.
+
+    .. versionchanged:: 0.12
+        The filename is no longer automatically inferred from file
+        objects. If you want to use automatic MIME and etag support,
+        pass a filename via ``filename_or_fp`` or
+        ``attachment_filename``.
+
+    .. versionchanged:: 0.12
+        ``attachment_filename`` is preferred over ``filename`` for MIME
+        detection.
+
+    .. versionchanged:: 0.9
+        ``cache_timeout`` defaults to
+        :meth:`Flask.get_send_file_max_age`.
+
+    .. versionchanged:: 0.7
+        MIME guessing and etag support for file-like objects was
+        removed because it was unreliable. Pass a filename if you are
+        able to, otherwise attach an etag yourself.
+
+    .. versionchanged:: 0.5
+        The ``add_etags``, ``cache_timeout`` and ``conditional``
+        parameters were added. The default behavior is to add etags.
+
+    .. versionadded:: 0.2
+    """
+    return werkzeug.utils.send_file(  # type: ignore[return-value]
+        **_prepare_send_file_kwargs(
+            path_or_file=path_or_file,
+            environ=request.environ,
+            mimetype=mimetype,
+            as_attachment=as_attachment,
+            download_name=download_name,
+            conditional=conditional,
+            etag=etag,
+            last_modified=last_modified,
+            max_age=max_age,
+        )
+    )
+
+
+def send_from_directory(
+    directory: os.PathLike[str] | str,
+    path: os.PathLike[str] | str,
+    **kwargs: t.Any,
+) -> Response:
+    """Send a file from within a directory using :func:`send_file`.
+
+    .. code-block:: python
+
+        @app.route("/uploads/<path:name>")
+        def download_file(name):
+            return send_from_directory(
+                app.config['UPLOAD_FOLDER'], name, as_attachment=True
+            )
+
+    This is a secure way to serve files from a folder, such as static
+    files or uploads. Uses :func:`~werkzeug.security.safe_join` to
+    ensure the path coming from the client is not maliciously crafted to
+    point outside the specified directory.
+
+    If the final path does not point to an existing regular file,
+    raises a 404 :exc:`~werkzeug.exceptions.NotFound` error.
+
+    :param directory: The directory that ``path`` must be located under,
+        relative to the current application's root path. This *must not*
+        be a value provided by the client, otherwise it becomes insecure.
+    :param path: The path to the file to send, relative to
+        ``directory``.
+    :param kwargs: Arguments to pass to :func:`send_file`.
+
+    .. versionchanged:: 2.0
+        ``path`` replaces the ``filename`` parameter.
+
+    .. versionadded:: 2.0
+        Moved the implementation to Werkzeug. This is now a wrapper to
+        pass some Flask-specific arguments.
+
+    .. versionadded:: 0.5
+    """
+    return werkzeug.utils.send_from_directory(  # type: ignore[return-value]
+        directory, path, **_prepare_send_file_kwargs(**kwargs)
+    )
+
+
+def get_root_path(import_name: str) -> str:
+    """Find the root path of a package, or the path that contains a
+    module. If it cannot be found, returns the current working
+    directory.
+
+    Not to be confused with the value returned by :func:`find_package`.
+
+    :meta private:
+    """
+    # Module already imported and has a file attribute. Use that first.
+    mod = sys.modules.get(import_name)
+
+    if mod is not None and hasattr(mod, "__file__") and mod.__file__ is not None:
+        return os.path.dirname(os.path.abspath(mod.__file__))
+
+    # Next attempt: check the loader.
+    try:
+        spec = importlib.util.find_spec(import_name)
+
+        if spec is None:
+            raise ValueError
+    except (ImportError, ValueError):
+        loader = None
+    else:
+        loader = spec.loader
+
+    # Loader does not exist or we're referring to an unloaded main
+    # module or a main module without path (interactive sessions), go
+    # with the current working directory.
+    if loader is None:
+        return os.getcwd()
+
+    if hasattr(loader, "get_filename"):
+        filepath = loader.get_filename(import_name)  # pyright: ignore
+    else:
+        # Fall back to imports.
+        __import__(import_name)
+        mod = sys.modules[import_name]
+        filepath = getattr(mod, "__file__", None)
+
+        # If we don't have a file path it might be because it is a
+        # namespace package. In this case pick the root path from the
+        # first module that is contained in the package.
+        if filepath is None:
+            raise RuntimeError(
+                "No root path can be found for the provided module"
+                f" {import_name!r}. This can happen because the module"
+                " came from an import hook that does not provide file"
+                " name information or because it's a namespace package."
+                " In this case the root path needs to be explicitly"
+                " provided."
+            )
+
+    # filepath is import_name.py for a module, or __init__.py for a package.
+    return os.path.dirname(os.path.abspath(filepath))  # type: ignore[no-any-return]
+
+
+@cache
+def _split_blueprint_path(name: str) -> list[str]:
+    out: list[str] = [name]
+
+    if "." in name:
+        out.extend(_split_blueprint_path(name.rpartition(".")[0]))
+
+    return out
+
+
+class _CollectErrors:
+    """A context manager that records and silences an error raised within it.
+    Used to run all teardown functions, then raise any errors afterward.
+    """
+
+    def __init__(self) -> None:
+        self.errors: list[BaseException] = []
+
+    def __enter__(self) -> None:
+        pass
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool:
+        if exc_val is not None:
+            self.errors.append(exc_val)
+
+        return True
+
+    def raise_any(self, message: str) -> None:
+        """Raise if any errors were collected."""
+        if self.errors:
+            if sys.version_info >= (3, 11):
+                raise BaseExceptionGroup(message, self.errors)  # noqa: F821
+            else:
+                raise self.errors[0]
+
+import copy
+import inspect
+import warnings
+from collections import defaultdict
+from functools import partialmethod
+from itertools import chain
+
+from asgiref.sync import sync_to_async
+
+import django
+from django.apps import apps
+from django.conf import settings
+from django.core import checks
+from django.core.exceptions import (
+    NON_FIELD_ERRORS,
+    FieldDoesNotExist,
+    FieldError,
+    MultipleObjectsReturned,
+    ObjectDoesNotExist,
+    ObjectNotUpdated,
+    ValidationError,
+)
+from django.db import (
+    DJANGO_VERSION_PICKLE_KEY,
+    DatabaseError,
+    connection,
+    connections,
+    router,
+    transaction,
+)
+from django.db.models import NOT_PROVIDED, ExpressionWrapper, IntegerField, Max, Value
+from django.db.models.constants import LOOKUP_SEP
+from django.db.models.deletion import CASCADE, DO_NOTHING, Collector, DatabaseOnDelete
+from django.db.models.expressions import DatabaseDefault
+from django.db.models.fetch_modes import FETCH_ONE
+from django.db.models.fields.composite import CompositePrimaryKey
+from django.db.models.fields.related import (
+    ForeignObjectRel,
+    OneToOneField,
+    lazy_related_operation,
+    resolve_relation,
+)
+from django.db.models.functions import Coalesce
+from django.db.models.manager import Manager
+from django.db.models.options import Options
+from django.db.models.query import F, Q
+from django.db.models.signals import (
+    class_prepared,
+    post_init,
+    post_save,
+    pre_init,
+    pre_save,
+)
+from django.db.models.utils import AltersData, make_model_tuple
+from django.utils.encoding import force_str
+from django.utils.hashable import make_hashable
+from django.utils.text import capfirst, get_text_list
+from django.utils.translation import gettext_lazy as _
+
+
+class Deferred:
+    def __repr__(self):
+        return "<Deferred field>"
+
+    def __str__(self):
+        return "<Deferred field>"
+
+
+DEFERRED = Deferred()
+
+
+def subclass_exception(name, bases, module, attached_to):
+    """
+    Create exception subclass. Used by ModelBase below.
+
+    The exception is created in a way that allows it to be pickled, assuming
+    that the returned exception class will be added as an attribute to the
+    'attached_to' class.
+    """
+    return type(
+        name,
+        bases,
+        {
+            "__module__": module,
+            "__qualname__": "%s.%s" % (attached_to.__qualname__, name),
+        },
+    )
+
+
+def _has_contribute_to_class(value):
+    # Only call contribute_to_class() if it's bound.
+    return not inspect.isclass(value) and hasattr(value, "contribute_to_class")
+
+
+class ModelBase(type):
+    """Metaclass for all models."""
+
+    def __new__(cls, name, bases, attrs, **kwargs):
+        super_new = super().__new__
+
+        # Also ensure initialization is only performed for subclasses of Model
+        # (excluding Model class itself).
+        parents = [b for b in bases if isinstance(b, ModelBase)]
+        if not parents:
+            return super_new(cls, name, bases, attrs)
+
+        # Create the class.
+        module = attrs.pop("__module__")
+        new_attrs = {"__module__": module}
+        classcell = attrs.pop("__classcell__", None)
+        if classcell is not None:
+            new_attrs["__classcell__"] = classcell
+        attr_meta = attrs.pop("Meta", None)
+        # Pass all attrs without a (Django-specific) contribute_to_class()
+        # method to type.__new__() so that they're properly initialized
+        # (i.e. __set_name__()).
+        contributable_attrs = {}
+        for obj_name, obj in attrs.items():
+            if _has_contribute_to_class(obj):
+                contributable_attrs[obj_name] = obj
+            else:
+                new_attrs[obj_name] = obj
+        new_class = super_new(cls, name, bases, new_attrs, **kwargs)
+
+        abstract = getattr(attr_meta, "abstract", False)
+        meta = attr_meta or getattr(new_class, "Meta", None)
+        base_meta = getattr(new_class, "_meta", None)
+
+        app_label = None
+
+        # Look for an application configuration to attach the model to.
+        app_config = apps.get_containing_app_config(module)
+
+        if getattr(meta, "app_label", None) is None:
+            if app_config is None:
+                if not abstract:
+                    raise RuntimeError(
+                        "Model class %s.%s doesn't declare an explicit "
+                        "app_label and isn't in an application in "
+                        "INSTALLED_APPS." % (module, name)
+                    )
+
+            else:
+                app_label = app_config.label
+
+        new_class.add_to_class("_meta", Options(meta, app_label))
+        if not abstract:
+            new_class.add_to_class(
+                "DoesNotExist",
+                subclass_exception(
+                    "DoesNotExist",
+                    tuple(
+                        x.DoesNotExist
+                        for x in parents
+                        if hasattr(x, "_meta") and not x._meta.abstract
+                    )
+                    or (ObjectDoesNotExist,),
+                    module,
+                    attached_to=new_class,
+                ),
+            )
+            new_class.add_to_class(
+                "MultipleObjectsReturned",
+                subclass_exception(
+                    "MultipleObjectsReturned",
+                    tuple(
+                        x.MultipleObjectsReturned
+                        for x in parents
+                        if hasattr(x, "_meta") and not x._meta.abstract
+                    )
+                    or (MultipleObjectsReturned,),
+                    module,
+                    attached_to=new_class,
+                ),
+            )
+            new_class.add_to_class(
+                "NotUpdated",
+                subclass_exception(
+                    "NotUpdated",
+                    tuple(
+                        x.NotUpdated
+                        for x in parents
+                        if hasattr(x, "_meta") and not x._meta.abstract
+                    )
+                    # Subclass DatabaseError as well for backward compatibility
+                    # reasons as __subclasshook__ is not taken into account on
+                    # exception handling.
+                    or (ObjectNotUpdated, DatabaseError),
+                    module,
+                    attached_to=new_class,
+                ),
+            )
+            if base_meta and not base_meta.abstract:
+                # Non-abstract child classes inherit some attributes from their
+                # non-abstract parent (unless an ABC comes before it in the
+                # method resolution order).
+                if not hasattr(meta, "ordering"):
+                    new_class._meta.ordering = base_meta.ordering
+                if not hasattr(meta, "get_latest_by"):
+                    new_class._meta.get_latest_by = base_meta.get_latest_by
+
+        is_proxy = new_class._meta.proxy
+
+        # If the model is a proxy, ensure that the base class
+        # hasn't been swapped out.
+        if is_proxy and base_meta and base_meta.swapped:
+            raise TypeError(
+                "%s cannot proxy the swapped model '%s'." % (name, base_meta.swapped)
+            )
+
+        # Add remaining attributes (those with a contribute_to_class() method)
+        # to the class.
+        for obj_name, obj in contributable_attrs.items():
+            new_class.add_to_class(obj_name, obj)
+
+        # All the fields of any type declared on this model
+        new_fields = chain(
+            new_class._meta.local_fields,
+            new_class._meta.local_many_to_many,
+            new_class._meta.private_fields,
+        )
+        field_names = {f.name for f in new_fields}
+
+        # Basic setup for proxy models.
+        if is_proxy:
+            base = None
+            for parent in [kls for kls in parents if hasattr(kls, "_meta")]:
+                if parent._meta.abstract:
+                    if parent._meta.fields:
+                        raise TypeError(
+                            "Abstract base class containing model fields not "
+                            "permitted for proxy model '%s'." % name
+                        )
+                    else:
+                        continue
+                if base is None:
+                    base = parent
+                elif parent._meta.concrete_model is not base._meta.concrete_model:
+                    raise TypeError(
+                        "Proxy model '%s' has more than one non-abstract model base "
+                        "class." % name
+                    )
+            if base is None:
+                raise TypeError(
+                    "Proxy model '%s' has no non-abstract model base class." % name
+                )
+            new_class._meta.setup_proxy(base)
+            new_class._meta.concrete_model = base._meta.concrete_model
+        else:
+            new_class._meta.concrete_model = new_class
+
+        # Collect the parent links for multi-table inheritance.
+        parent_links = {}
+        for base in reversed([new_class, *parents]):
+            # Conceptually equivalent to `if base is Model`.
+            if not hasattr(base, "_meta"):
+                continue
+            # Skip concrete parent classes.
+            if base != new_class and not base._meta.abstract:
+                continue
+            # Locate OneToOneField instances.
+            for field in base._meta.local_fields:
+                if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+                    related = resolve_relation(new_class, field.remote_field.model)
+                    parent_links[make_model_tuple(related)] = field
+
+        # Track fields inherited from base models.
+        inherited_attributes = set()
+        # Do the appropriate setup for any model parents.
+        for base in new_class.mro():
+            if base not in parents or not hasattr(base, "_meta"):
+                # Things without _meta aren't functional models, so they're
+                # uninteresting parents.
+                inherited_attributes.update(base.__dict__)
+                continue
+
+            parent_fields = base._meta.local_fields + base._meta.local_many_to_many
+            if not base._meta.abstract:
+                # Check for clashes between locally declared fields and those
+                # on the base classes.
+                for field in parent_fields:
+                    if field.name in field_names:
+                        raise FieldError(
+                            "Local field %r in class %r clashes with field of "
+                            "the same name from base class %r."
+                            % (
+                                field.name,
+                                name,
+                                base.__name__,
+                            )
+                        )
+                    else:
+                        inherited_attributes.add(field.name)
+
+                # Concrete classes...
+                base = base._meta.concrete_model
+                base_key = make_model_tuple(base)
+                if base_key in parent_links:
+                    field = parent_links[base_key]
+                elif not is_proxy:
+                    attr_name = "%s_ptr" % base._meta.model_name
+                    field = OneToOneField(
+                        base,
+                        on_delete=CASCADE,
+                        name=attr_name,
+                        auto_created=True,
+                        parent_link=True,
+                    )
+
+                    if attr_name in field_names:
+                        raise FieldError(
+                            "Auto-generated field '%s' in class %r for "
+                            "parent_link to base class %r clashes with "
+                            "declared field of the same name."
+                            % (
+                                attr_name,
+                                name,
+                                base.__name__,
+                            )
+                        )
+
+                    # Only add the ptr field if it's not already present;
+                    # e.g. migrations will already have it specified
+                    if not hasattr(new_class, attr_name):
+                        new_class.add_to_class(attr_name, field)
+                else:
+                    field = None
+                new_class._meta.parents[base] = field
+            else:
+                base_parents = base._meta.parents.copy()
+
+                # Add fields from abstract base class if it wasn't overridden.
+                for field in parent_fields:
+                    if (
+                        field.name not in field_names
+                        and field.name not in new_class.__dict__
+                        and field.name not in inherited_attributes
+                    ):
+                        new_field = copy.deepcopy(field)
+                        new_class.add_to_class(field.name, new_field)
+                        # Replace parent links defined on this base by the new
+                        # field. It will be appropriately resolved if required.
+                        if field.one_to_one:
+                            for parent, parent_link in base_parents.items():
+                                if field == parent_link:
+                                    base_parents[parent] = new_field
+
+                # Pass any non-abstract parent classes onto child.
+                new_class._meta.parents.update(base_parents)
+
+            # Inherit private fields (like GenericForeignKey) from the parent
+            # class if they are not overridden.
+            for field in base._meta.private_fields:
+                if field.name in field_names:
+                    if not base._meta.abstract:
+                        raise FieldError(
+                            "Local field %r in class %r clashes with field of "
+                            "the same name from base class %r."
+                            % (
+                                field.name,
+                                name,
+                                base.__name__,
+                            )
+                        )
+                elif (
+                    field.name not in new_class.__dict__
+                    and field.name not in inherited_attributes
+                ):
+                    field = copy.deepcopy(field)
+                    if not base._meta.abstract:
+                        field.mti_inherited = True
+                    new_class.add_to_class(field.name, field)
+
+        # Copy indexes so that index names are unique when models extend an
+        # abstract model.
+        new_class._meta.indexes = [
+            copy.deepcopy(idx) for idx in new_class._meta.indexes
+        ]
+
+        if abstract:
+            # Abstract base models can't be instantiated and don't appear in
+            # the list of models for an app. We do the final setup for them a
+            # little differently from normal models.
+            attr_meta.abstract = False
+            new_class.Meta = attr_meta
+            return new_class
+
+        new_class._prepare()
+        new_class._meta.apps.register_model(new_class._meta.app_label, new_class)
+        return new_class
+
+    def add_to_class(cls, name, value):
+        if _has_contribute_to_class(value):
+            value.contribute_to_class(cls, name)
+        else:
+            setattr(cls, name, value)
+
+    def _prepare(cls):
+        """Create some methods once self._meta has been populated."""
+        opts = cls._meta
+        opts._prepare(cls)
+
+        if opts.order_with_respect_to:
+            cls.get_next_in_order = partialmethod(
+                cls._get_next_or_previous_in_order, is_next=True
+            )
+            cls.get_previous_in_order = partialmethod(
+                cls._get_next_or_previous_in_order, is_next=False
+            )
+
+            # Defer creating accessors on the foreign class until it has been
+            # created and registered. If remote_field is None, we're ordering
+            # with respect to a GenericForeignKey and don't know what the
+            # foreign class is - we'll add those accessors later in
+            # contribute_to_class().
+            if opts.order_with_respect_to.remote_field:
+                wrt = opts.order_with_respect_to
+                remote = wrt.remote_field.model
+                lazy_related_operation(make_foreign_order_accessors, cls, remote)
+
+        # Give the class a docstring -- its definition.
+        if cls.__doc__ is None:
+            cls.__doc__ = "%s(%s)" % (
+                cls.__name__,
+                ", ".join(f.name for f in opts.fields),
+            )
+
+        get_absolute_url_override = settings.ABSOLUTE_URL_OVERRIDES.get(
+            opts.label_lower
+        )
+        if get_absolute_url_override:
+            setattr(cls, "get_absolute_url", get_absolute_url_override)
+
+        if not opts.managers:
+            if any(f.name == "objects" for f in opts.fields):
+                raise ValueError(
+                    "Model %s must specify a custom Manager, because it has a "
+                    "field named 'objects'." % cls.__name__
+                )
+            manager = Manager()
+            manager.auto_created = True
+            cls.add_to_class("objects", manager)
+
+        # Set the name of _meta.indexes. This can't be done in
+        # Options.contribute_to_class() because fields haven't been added to
+        # the model at that point.
+        for index in cls._meta.indexes:
+            if not index.name:
+                index.set_name_with_model(cls)
+
+        class_prepared.send(sender=cls)
+
+    @property
+    def _base_manager(cls):
+        return cls._meta.base_manager
+
+    @property
+    def _default_manager(cls):
+        return cls._meta.default_manager
+
+
+class ModelStateFieldsCacheDescriptor:
+    def __get__(self, instance, cls=None):
+        if instance is None:
+            return self
+        res = instance.fields_cache = {}
+        return res
+
+
+class ModelStateFetchModeDescriptor:
+    def __get__(self, instance, cls=None):
+        if instance is None:
+            return self
+        res = instance.fetch_mode = FETCH_ONE
+        return res
+
+
+class ModelState:
+    """Store model instance state."""
+
+    db = None
+    # If true, uniqueness validation checks will consider this a new, unsaved
+    # object. Necessary for correct validation of new instances of objects with
+    # explicit (non-auto) PKs. This impacts validation only; it has no effect
+    # on the actual save.
+    adding = True
+    fields_cache = ModelStateFieldsCacheDescriptor()
+    fetch_mode = ModelStateFetchModeDescriptor()
+    peers = ()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Weak references can't be pickled.
+        state.pop("peers", None)
+        return state
+
+    def __del__(self):
+        self.fields_cache.clear()
+
+
+class Model(AltersData, metaclass=ModelBase):
+    def __init__(self, *args, **kwargs):
+        # Alias some things as locals to avoid repeat global lookups
+        cls = self.__class__
+        opts = self._meta
+        _setattr = setattr
+        _DEFERRED = DEFERRED
+        if opts.abstract:
+            raise TypeError("Abstract models cannot be instantiated.")
+
+        pre_init.send(sender=cls, args=args, kwargs=kwargs)
+
+        # Set up the storage for instance state
+        self._state = ModelState()
+
+        # There is a rather weird disparity here; if kwargs, it's set, then
+        # args overrides it. It should be one or the other; don't duplicate the
+        # work The reason for the kwargs check is that standard iterator passes
+        # in by args, and instantiation for iteration is 33% faster.
+        if len(args) > len(opts.concrete_fields):
+            # Daft, but matches old exception sans the err msg.
+            raise IndexError("Number of args exceeds number of fields")
+
+        if not kwargs:
+            fields_iter = iter(opts.concrete_fields)
+            # The ordering of the zip calls matter - zip throws StopIteration
+            # when an iter throws it. So if the first iter throws it, the
+            # second is *not* consumed. We rely on this, so don't change the
+            # order without changing the logic.
+            for val, field in zip(args, fields_iter):
+                if val is _DEFERRED:
+                    continue
+                _setattr(self, field.attname, val)
+        else:
+            # Slower, kwargs-ready version.
+            fields_iter = iter(opts.fields)
+            for val, field in zip(args, fields_iter):
+                if val is _DEFERRED:
+                    continue
+                _setattr(self, field.attname, val)
+                if kwargs.pop(field.name, NOT_PROVIDED) is not NOT_PROVIDED:
+                    raise TypeError(
+                        f"{cls.__qualname__}() got both positional and "
+                        f"keyword arguments for field '{field.name}'."
+                    )
+
+        # Now we're left with the unprocessed fields that *must* come from
+        # keywords, or default.
+
+        for field in fields_iter:
+            is_related_object = False
+            # Virtual field
+            if field.column is None or field.generated:
+                continue
+            if kwargs:
+                if isinstance(field.remote_field, ForeignObjectRel):
+                    try:
+                        # Assume object instance was passed in.
+                        rel_obj = kwargs.pop(field.name)
+                        is_related_object = True
+                    except KeyError:
+                        try:
+                            # Object instance wasn't passed in -- must be an
+                            # ID.
+                            val = kwargs.pop(field.attname)
+                        except KeyError:
+                            val = field.get_default()
+                else:
+                    try:
+                        val = kwargs.pop(field.attname)
+                    except KeyError:
+                        # This is done with an exception rather than the
+                        # default argument on pop because we don't want
+                        # get_default() to be evaluated, and then not used.
+                        # Refs #12057.
+                        val = field.get_default()
+            else:
+                val = field.get_default()
+
+            if is_related_object:
+                # If we are passed a related instance, set it using the
+                # field.name instead of field.attname (e.g. "user" instead of
+                # "user_id") so that the object gets properly cached (and type
+                # checked) by the RelatedObjectDescriptor.
+                if rel_obj is not _DEFERRED:
+                    _setattr(self, field.name, rel_obj)
+            else:
+                if val is not _DEFERRED:
+                    _setattr(self, field.attname, val)
+
+        if kwargs:
+            property_names = opts._property_names
+            unexpected = ()
+            for prop, value in kwargs.items():
+                # Any remaining kwargs must correspond to properties or virtual
+                # fields.
+                if prop in property_names:
+                    if value is not _DEFERRED:
+                        _setattr(self, prop, value)
+                else:
+                    try:
+                        opts.get_field(prop)
+                    except FieldDoesNotExist:
+                        unexpected += (prop,)
+                    else:
+                        if value is not _DEFERRED:
+                            _setattr(self, prop, value)
+            if unexpected:
+                unexpected_names = ", ".join(repr(n) for n in unexpected)
+                raise TypeError(
+                    f"{cls.__name__}() got unexpected keyword arguments: "
+                    f"{unexpected_names}"
+                )
+        super().__init__()
+        post_init.send(sender=cls, instance=self)
+
+    @classmethod
+    def from_db(cls, db, field_names, values, *, fetch_mode=None):
+        if len(values) != len(cls._meta.concrete_fields):
+            values_iter = iter(values)
+            values = [
+                next(values_iter) if f.attname in field_names else DEFERRED
+                for f in cls._meta.concrete_fields
+            ]
+        new = cls(*values)
+        new._state.adding = False
+        new._state.db = db
+        if fetch_mode is not None:
+            new._state.fetch_mode = fetch_mode
+        return new
+
+    def __repr__(self):
+        return "<%s: %s>" % (self.__class__.__name__, self)
+
+    def __str__(self):
+        return "%s object (%s)" % (self.__class__.__name__, self.pk)
+
+    def __eq__(self, other):
+        if not isinstance(other, Model):
+            return NotImplemented
+        if self._meta.concrete_model != other._meta.concrete_model:
+            return False
+        my_pk = self.pk
+        if my_pk is None:
+            return self is other
+        return my_pk == other.pk
+
+    def __hash__(self):
+        if not self._is_pk_set():
+            raise TypeError("Model instances without primary key value are unhashable")
+        return hash(self.pk)
+
+    def __reduce__(self):
+        data = self.__getstate__()
+        data[DJANGO_VERSION_PICKLE_KEY] = django.__version__
+        class_id = self._meta.app_label, self._meta.object_name
+        return model_unpickle, (class_id,), data
+
+    def __getstate__(self):
+        """Hook to allow choosing the attributes to pickle."""
+        state = self.__dict__.copy()
+        state["_state"] = copy.copy(state["_state"])
+        state["_state"].fields_cache = state["_state"].fields_cache.copy()
+        # memoryview cannot be pickled, so cast it to bytes and store
+        # separately.
+        _memoryview_attrs = []
+        for attr, value in state.items():
+            if isinstance(value, memoryview):
+                _memoryview_attrs.append((attr, bytes(value)))
+        if _memoryview_attrs:
+            state["_memoryview_attrs"] = _memoryview_attrs
+            for attr, value in _memoryview_attrs:
+                state.pop(attr)
+        return state
+
+    def __setstate__(self, state):
+        pickled_version = state.get(DJANGO_VERSION_PICKLE_KEY)
+        if pickled_version:
+            if pickled_version != django.__version__:
+                warnings.warn(
+                    "Pickled model instance's Django version %s does not "
+                    "match the current version %s."
+                    % (pickled_version, django.__version__),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        else:
+            warnings.warn(
+                "Pickled model instance's Django version is not specified.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if "_memoryview_attrs" in state:
+            for attr, value in state.pop("_memoryview_attrs"):
+                state[attr] = memoryview(value)
+        self.__dict__.update(state)
+
+    def _get_pk_val(self, meta=None):
+        meta = meta or self._meta
+        return getattr(self, meta.pk.attname)
+
+    def _set_pk_val(self, value):
+        for parent_link in self._meta.parents.values():
+            if parent_link and parent_link != self._meta.pk:
+                setattr(self, parent_link.target_field.attname, value)
+        return setattr(self, self._meta.pk.attname, value)
+
+    pk = property(_get_pk_val, _set_pk_val)
+
+    def _is_pk_set(self, meta=None):
+        pk_val = self._get_pk_val(meta)
+        return not (
+            pk_val is None
+            or (isinstance(pk_val, tuple) and any(f is None for f in pk_val))
+        )
+
+    def get_deferred_fields(self):
+        """
+        Return a set containing names of deferred fields for this instance.
+        """
+        return {
+            f.attname
+            for f in self._meta.concrete_fields
+            if f.attname not in self.__dict__
+        }
+
+    def refresh_from_db(self, using=None, fields=None, from_queryset=None):
+        """
+        Reload field values from the database.
+
+        By default, the reloading happens from the database this instance was
+        loaded from, or by the read router if this instance wasn't loaded from
+        any database. The using parameter will override the default.
+
+        Fields can be used to specify which fields to reload. The fields
+        should be an iterable of field attnames. If fields is None, then
+        all non-deferred fields are reloaded.
+
+        When fetching deferred fields for a single instance (the FETCH_ONE
+        fetch mode), the deferred loading uses this method.
+        """
+        if fields is None:
+            self._prefetched_objects_cache = {}
+        else:
+            prefetched_objects_cache = getattr(self, "_prefetched_objects_cache", ())
+            fields = set(fields)
+            for field in fields.copy():
+                if field in prefetched_objects_cache:
+                    del prefetched_objects_cache[field]
+                    fields.remove(field)
+            if not fields:
+                return
+            if any(LOOKUP_SEP in f for f in fields):
+                raise ValueError(
+                    'Found "%s" in fields argument. Relations and transforms '
+                    "are not allowed in fields." % LOOKUP_SEP
+                )
+
+        if from_queryset is None:
+            hints = {"instance": self}
+            from_queryset = self.__class__._base_manager.db_manager(using, hints=hints)
+        elif using is not None:
+            from_queryset = from_queryset.using(using)
+
+        db_instance_qs = from_queryset.filter(pk=self.pk)
+
+        # Use provided fields, if not set then reload all non-deferred fields.
+        deferred_fields = self.get_deferred_fields()
+        if fields is not None:
+            db_instance_qs = db_instance_qs.only(*fields)
+        elif deferred_fields:
+            db_instance_qs = db_instance_qs.only(
+                *{
+                    f.attname
+                    for f in self._meta.concrete_fields
+                    if f.attname not in deferred_fields
+                }
+            )
+
+        db_instance = db_instance_qs.get()
+        non_loaded_fields = db_instance.get_deferred_fields()
+        for field in self._meta.fields:
+            if field.attname in non_loaded_fields:
+                # This field wasn't refreshed - skip ahead.
+                continue
+            if field.concrete:
+                setattr(self, field.attname, getattr(db_instance, field.attname))
+            # Clear or copy cached foreign keys.
+            if field.is_relation:
+                if field.is_cached(db_instance):
+                    field.set_cached_value(self, field.get_cached_value(db_instance))
+                elif field.is_cached(self):
+                    field.delete_cached_value(self)
+
+        # Clear cached relations.
+        for rel in self._meta.related_objects:
+            if (fields is None or rel.name in fields) and rel.is_cached(self):
+                rel.delete_cached_value(self)
+
+        # Clear cached private relations.
+        for field in self._meta.private_fields:
+            if (
+                (fields is None or field.name in fields)
+                and field.is_relation
+                and field.is_cached(self)
+            ):
+                field.delete_cached_value(self)
+
+        self._state.db = db_instance._state.db
+
+    async def arefresh_from_db(self, using=None, fields=None, from_queryset=None):
+        return await sync_to_async(self.refresh_from_db)(
+            using=using, fields=fields, from_queryset=from_queryset
+        )
+
+    def serializable_value(self, field_name):
+        """
+        Return the value of the field name for this instance. If the field is
+        a foreign key, return the id value instead of the object. If there's
+        no Field object with this name on the model, return the model
+        attribute's value.
+
+        Used to serialize a field's value (in the serializer, or form output,
+        for example). Normally, you would just access the attribute directly
+        and not use this method.
+        """
+        try:
+            field = self._meta.get_field(field_name)
+        except FieldDoesNotExist:
+            return getattr(self, field_name)
+        return getattr(self, field.attname)
+
+    def save(
+        self,
+        *,
+        force_insert=False,
+        force_update=False,
+        using=None,
+        update_fields=None,
+    ):
+        """
+        Save the current instance. Override this in a subclass if you want to
+        control the saving process.
+
+        The 'force_insert' and 'force_update' parameters can be used to insist
+        that the "save" must be an SQL insert or update (or equivalent for
+        non-SQL backends), respectively. Normally, they should not be set.
+        """
+
+        self._prepare_related_fields_for_save(operation_name="save")
+
+        using = using or router.db_for_write(self.__class__, instance=self)
+        if force_insert and (force_update or update_fields):
+            raise ValueError("Cannot force both insert and updating in model saving.")
+
+        deferred_non_generated_fields = {
+            f.attname
+            for f in self._meta.concrete_fields
+            if f.attname not in self.__dict__ and f.generated is False
+        }
+        if update_fields is not None:
+            # If update_fields is empty, skip the save. We do also check for
+            # no-op saves later on for inheritance cases. This bailout is
+            # still needed for skipping signal sending.
+            if not update_fields:
+                return
+
+            update_fields = frozenset(update_fields)
+            field_names = self._meta._non_pk_concrete_field_names
+            not_updatable_fields = update_fields.difference(field_names)
+
+            if not_updatable_fields:
+                raise ValueError(
+                    "The following fields do not exist in this model, are m2m "
+                    "fields, primary keys, or are non-concrete fields: %s"
+                    % ", ".join(not_updatable_fields)
+                )
+
+        # If saving to the same database, and this model is deferred, then
+        # automatically do an "update_fields" save on the loaded fields.
+        elif (
+            not force_insert
+            and deferred_non_generated_fields
+            and using == self._state.db
+            and self._is_pk_set()
+        ):
+            field_names = set()
+            pk_fields = self._meta.pk_fields
+            for field in self._meta.concrete_fields:
+                if field not in pk_fields and not hasattr(field, "through"):
+                    field_names.add(field.attname)
+            loaded_fields = field_names.difference(deferred_non_generated_fields)
+            if loaded_fields:
+                update_fields = frozenset(loaded_fields)
+
+        self.save_base(
+            using=using,
+            force_insert=force_insert,
+            force_update=force_update,
+            update_fields=update_fields,
+        )
+
+    save.alters_data = True
+
+    async def asave(
+        self,
+        *,
+        force_insert=False,
+        force_update=False,
+        using=None,
+        update_fields=None,
+    ):
+        return await sync_to_async(self.save)(
+            force_insert=force_insert,
+            force_update=force_update,
+            using=using,
+            update_fields=update_fields,
+        )
+
+    asave.alters_data = True
+
+    @classmethod
+    def _validate_force_insert(cls, force_insert):
+        if force_insert is False:
+            return ()
+        if force_insert is True:
+            return (cls,)
+        if not isinstance(force_insert, tuple):
+            raise TypeError("force_insert must be a bool or tuple.")
+        for member in force_insert:
+            if not isinstance(member, ModelBase):
+                raise TypeError(
+                    f"Invalid force_insert member. {member!r} must be a model subclass."
+                )
+            if not issubclass(cls, member):
+                raise TypeError(
+                    f"Invalid force_insert member. {member.__qualname__} must be a "
+                    f"base of {cls.__qualname__}."
+                )
+        return force_insert
+
+    def save_base(
+        self,
+        raw=False,
+        force_insert=False,
+        force_update=False,
+        using=None,
+        update_fields=None,
+    ):
+        """
+        Handle the parts of saving which should be done only once per save,
+        yet need to be done in raw saves, too. This includes some sanity
+        checks and signal sending.
+
+        The 'raw' argument is telling save_base not to save any parent
+        models and not to do any changes to the values before save. This
+        is used by fixture loading.
+        """
+        using = using or router.db_for_write(self.__class__, instance=self)
+        assert not (force_insert and (force_update or update_fields))
+        assert update_fields is None or update_fields
+        cls = origin = self.__class__
+        # Skip proxies, but keep the origin as the proxy model.
+        if cls._meta.proxy:
+            cls = cls._meta.concrete_model
+        meta = cls._meta
+        if not meta.auto_created:
+            pre_save.send(
+                sender=origin,
+                instance=self,
+                raw=raw,
+                using=using,
+                update_fields=update_fields,
+            )
+        # A transaction isn't needed if one query is issued.
+        if meta.parents:
+            context_manager = transaction.atomic(using=using, savepoint=False)
+        else:
+            context_manager = transaction.mark_for_rollback_on_error(using=using)
+        with context_manager:
+            parent_inserted = False
+            if not raw:
+                # Validate force insert only when parents are inserted.
+                force_insert = self._validate_force_insert(force_insert)
+                parent_inserted = self._save_parents(
+                    cls, using, update_fields, force_insert
+                )
+            updated = self._save_table(
+                raw,
+                cls,
+                force_insert or parent_inserted,
+                force_update,
+                using,
+                update_fields,
+            )
+        # Store the database on which the object was saved
+        self._state.db = using
+        # Once saved, this is no longer a to-be-added instance.
+        self._state.adding = False
+
+        # Signal that the save is complete
+        if not meta.auto_created:
+            post_save.send(
+                sender=origin,
+                instance=self,
+                created=(not updated),
+                update_fields=update_fields,
+                raw=raw,
+                using=using,
+            )
+
+    save_base.alters_data = True
+
+    def _save_parents(
+        self, cls, using, update_fields, force_insert, updated_parents=None
+    ):
+        """Save all the parents of cls using values from self."""
+        meta = cls._meta
+        inserted = False
+        if updated_parents is None:
+            updated_parents = {}
+        for parent, field in meta.parents.items():
+            # Make sure the link fields are synced between parent and self.
+            if (
+                field
+                and getattr(self, parent._meta.pk.attname) is None
+                and getattr(self, field.attname) is not None
+            ):
+                setattr(self, parent._meta.pk.attname, getattr(self, field.attname))
+            if (parent_updated := updated_parents.get(parent)) is None:
+                parent_inserted = self._save_parents(
+                    cls=parent,
+                    using=using,
+                    update_fields=update_fields,
+                    force_insert=force_insert,
+                    updated_parents=updated_parents,
+                )
+                updated = self._save_table(
+                    cls=parent,
+                    using=using,
+                    update_fields=update_fields,
+                    force_insert=parent_inserted or issubclass(parent, force_insert),
+                )
+                if not updated:
+                    inserted = True
+                updated_parents[parent] = updated
+            elif not parent_updated:
+                inserted = True
+            # Set the parent's PK value to self.
+            if field:
+                setattr(self, field.attname, self._get_pk_val(parent._meta))
+                # Since we didn't have an instance of the parent handy set
+                # attname directly, bypassing the descriptor. Invalidate
+                # the related object cache, in case it's been accidentally
+                # populated. A fresh instance will be re-built from the
+                # database if necessary.
+                if field.is_cached(self):
+                    field.delete_cached_value(self)
+        return inserted
+
+    def _save_table(
+        self,
+        raw=False,
+        cls=None,
+        force_insert=False,
+        force_update=False,
+        using=None,
+        update_fields=None,
+    ):
+        """
+        Do the heavy-lifting involved in saving. Update or insert the data
+        for a single table.
+        """
+        meta = cls._meta
+        pk_fields = meta.pk_fields
+        non_pks_non_generated = [
+            f
+            for f in meta.local_concrete_fields
+            if f not in pk_fields and not f.generated
+        ]
+
+        if update_fields:
+            non_pks_non_generated = [
+                f
+                for f in non_pks_non_generated
+                if f.name in update_fields or f.attname in update_fields
+            ]
+
+        if not self._is_pk_set(meta):
+            pk_val = meta.pk.get_pk_value_on_save(self)
+            setattr(self, meta.pk.attname, pk_val)
+        pk_set = self._is_pk_set(meta)
+        if not pk_set and (force_update or update_fields):
+            raise ValueError("Cannot force an update in save() with no primary key.")
+        updated = False
+        # Skip an UPDATE when adding an instance and primary key has a default.
+        if (
+            not raw
+            and not force_insert
+            and not force_update
+            and self._state.adding
+            and all(f.has_default() or f.has_db_default() for f in meta.pk_fields)
+        ):
+            force_insert = True
+        # If possible, try an UPDATE. If that doesn't update anything, do an
+        # INSERT.
+        if pk_set and not force_insert:
+            base_qs = cls._base_manager.using(using)
+            values = [
+                (
+                    f,
+                    None,
+                    (getattr(self, f.attname) if raw else f.pre_save(self, False)),
+                )
+                for f in non_pks_non_generated
+            ]
+            forced_update = update_fields or force_update
+            pk_val = self._get_pk_val(meta)
+            returning_fields = [
+                f
+                for f in meta.local_concrete_fields
+                if (
+                    f.generated
+                    and f.referenced_fields.intersection(non_pks_non_generated)
+                )
+            ]
+            for field, _model, value in values:
+                if (update_fields is None or field.name in update_fields) and hasattr(
+                    value, "resolve_expression"
+                ):
+                    returning_fields.append(field)
+            results = self._do_update(
+                base_qs,
+                using,
+                pk_val,
+                values,
+                update_fields,
+                forced_update,
+                returning_fields,
+            )
+            if updated := bool(results):
+                self._assign_returned_values(results[0], returning_fields)
+            elif force_update:
+                raise self.NotUpdated("Forced update did not affect any rows.")
+            elif update_fields:
+                raise self.NotUpdated(
+                    "Save with update_fields did not affect any rows."
+                )
+        if not updated:
+            if meta.order_with_respect_to:
+                # If this is a model with an order_with_respect_to
+                # autopopulate the _order field
+                field = meta.order_with_respect_to
+                filter_args = field.get_filter_kwargs_for_object(self)
+                self._order = (
+                    cls._base_manager.using(using)
+                    .filter(**filter_args)
+                    .aggregate(
+                        _order__max=Coalesce(
+                            ExpressionWrapper(
+                                Max("_order") + Value(1), output_field=IntegerField()
+                            ),
+                            Value(0),
+                        ),
+                    )["_order__max"]
+                )
+            insert_fields = [
+                f
+                for f in meta.local_concrete_fields
+                if not f.generated and (pk_set or f is not meta.auto_field)
+            ]
+            returning_fields = list(meta.db_returning_fields)
+            can_return_columns_from_insert = connections[
+                using
+            ].features.can_return_columns_from_insert
+            for field in insert_fields:
+                value = (
+                    getattr(self, field.attname)
+                    if raw
+                    else field.pre_save(self, add=True)
+                )
+                if hasattr(value, "resolve_expression"):
+                    if field not in returning_fields:
+                        returning_fields.append(field)
+                elif (
+                    field.db_returning
+                    and not can_return_columns_from_insert
+                    and not (pk_set and field is meta.auto_field)
+                ):
+                    returning_fields.remove(field)
+            results = self._do_insert(
+                cls._base_manager, using, insert_fields, returning_fields, raw
+            )
+            if results:
+                self._assign_returned_values(results[0], returning_fields)
+        return updated
+
+    def _do_update(
+        self,
+        base_qs,
+        using,
+        pk_val,
+        values,
+        update_fields,
+        forced_update,
+        returning_fields,
+    ):
+        """
+        Try to update the model. Return a list of updated fields if the model
+        was updated (if an update query was done and a matching row was
+        found in the DB).
+        """
+        filtered = base_qs.filter(pk=pk_val)
+        if not values:
+            # We can end up here when saving a model in inheritance chain where
+            # update_fields doesn't target any field in current model. In that
+            # case we just say the update succeeded. Another case ending up
+            # here is a model with just PK - in that case check that the PK
+            # still exists.
+            if update_fields is not None or filtered.exists():
+                return [()]
+            return []
+        if self._meta.select_on_save and not forced_update:
+            # It may happen that the object is deleted from the DB right after
+            # this check, causing the subsequent UPDATE to return zero matching
+            # rows. The same result can occur in some rare cases when the
+            # database returns zero despite the UPDATE being executed
+            # successfully (a row is matched and updated). In order to
+            # distinguish these two cases, the object's existence in the
+            # database is again checked for if the UPDATE query returns 0.
+            if not filtered.exists():
+                return []
+            if results := filtered._update(values, returning_fields):
+                return results
+            return [()] if filtered.exists() else []
+        return filtered._update(values, returning_fields)
+
+    def _do_insert(self, manager, using, fields, returning_fields, raw):
+        """
+        Do an INSERT. If returning_fields is defined then this method should
+        return the newly created data for the model.
+        """
+        return manager._insert(
+            [self],
+            fields=fields,
+            returning_fields=returning_fields,
+            using=using,
+            raw=raw,
+        )
+
+    def _assign_returned_values(self, returned_values, returning_fields):
+        returning_fields_iter = iter(returning_fields)
+        for value, field in zip(returned_values, returning_fields_iter):
+            setattr(self, field.attname, value)
+        # Defer all fields that were meant to be updated with their database
+        # resolved values but couldn't as they are effectively stale.
+        for field in returning_fields_iter:
+            self.__dict__.pop(field.attname, None)
+
+    def _prepare_related_fields_for_save(self, operation_name, fields=None):
+        # Ensure that a model instance without a PK hasn't been assigned to
+        # a ForeignKey, GenericForeignKey or OneToOneField on this model. If
+        # the field is nullable, allowing the save would result in silent data
+        # loss.
+        for field in self._meta.concrete_fields:
+            if fields and field not in fields:
+                continue
+            # If the related field isn't cached, then an instance hasn't been
+            # assigned and there's no need to worry about this check.
+            if field.is_relation and field.is_cached(self):
+                obj = getattr(self, field.name, None)
+                if not obj:
+                    continue
+                # A pk may have been assigned manually to a model instance not
+                # saved to the database (or auto-generated in a case like
+                # UUIDField), but we allow the save to proceed and rely on the
+                # database to raise an IntegrityError if applicable. If
+                # constraints aren't supported by the database, there's the
+                # unavoidable risk of data corruption.
+                if not obj._is_pk_set():
+                    # Remove the object from a related instance cache.
+                    if not field.remote_field.multiple:
+                        field.remote_field.delete_cached_value(obj)
+                    raise ValueError(
+                        "%s() prohibited to prevent data loss due to unsaved "
+                        "related object '%s'." % (operation_name, field.name)
+                    )
+                elif getattr(self, field.attname) in field.empty_values:
+                    # Set related object if it has been saved after an
+                    # assignment.
+                    setattr(self, field.name, obj)
+                # If the relationship's pk/to_field was changed, clear the
+                # cached relationship.
+                if getattr(obj, field.target_field.attname) != getattr(
+                    self, field.attname
+                ):
+                    field.delete_cached_value(self)
+        # GenericForeignKeys are private.
+        for field in self._meta.private_fields:
+            if fields and field not in fields:
+                continue
+            if (
+                field.is_relation
+                and field.is_cached(self)
+                and hasattr(field, "fk_field")
+            ):
+                obj = field.get_cached_value(self, default=None)
+                if obj and not obj._is_pk_set():
+                    raise ValueError(
+                        f"{operation_name}() prohibited to prevent data loss due to "
+                        f"unsaved related object '{field.name}'."
+                    )
+
+    def delete(self, using=None, keep_parents=False):
+        if not self._is_pk_set():
+            raise ValueError(
+                "%s object can't be deleted because its %s attribute is set "
+                "to None." % (self._meta.object_name, self._meta.pk.attname)
+            )
+        using = using or router.db_for_write(self.__class__, instance=self)
+        collector = Collector(using=using, origin=self)
+        collector.collect([self], keep_parents=keep_parents)
+        return collector.delete()
+
+    delete.alters_data = True
+
+    async def adelete(self, using=None, keep_parents=False):
+        return await sync_to_async(self.delete)(
+            using=using,
+            keep_parents=keep_parents,
+        )
+
+    adelete.alters_data = True
+
+    def _get_FIELD_display(self, field):
+        value = getattr(self, field.attname)
+        choices_dict = dict(make_hashable(field.flatchoices))
+        # force_str() to coerce lazy strings.
+        return force_str(
+            choices_dict.get(make_hashable(value), value), strings_only=True
+        )
+
+    def _get_next_or_previous_by_FIELD(self, field, is_next, **kwargs):
+        if not self._is_pk_set():
+            raise ValueError("get_next/get_previous cannot be used on unsaved objects.")
+        op = "gt" if is_next else "lt"
+        order = "" if is_next else "-"
+        param = getattr(self, field.attname)
+        q = Q.create([(field.name, param), (f"pk__{op}", self.pk)], connector=Q.AND)
+        q = Q.create([q, (f"{field.name}__{op}", param)], connector=Q.OR)
+        qs = (
+            self.__class__._default_manager.using(self._state.db)
+            .filter(**kwargs)
+            .filter(q)
+            .order_by("%s%s" % (order, field.name), "%spk" % order)
+        )
+        try:
+            return qs[0]
+        except IndexError:
+            raise self.DoesNotExist(
+                "%s matching query does not exist." % self.__class__._meta.object_name
+            )
+
+    def _get_next_or_previous_in_order(self, is_next):
+        cachename = "__%s_order_cache" % is_next
+        if not hasattr(self, cachename):
+            op = "gt" if is_next else "lt"
+            order = "_order" if is_next else "-_order"
+            order_field = self._meta.order_with_respect_to
+            filter_args = order_field.get_filter_kwargs_for_object(self)
+            obj = (
+                self.__class__._default_manager.filter(**filter_args)
+                .filter(
+                    **{
+                        "_order__%s"
+                        % op: self.__class__._default_manager.values("_order").filter(
+                            **{self._meta.pk.name: self.pk}
+                        )
+                    }
+                )
+                .order_by(order)[:1]
+                .get()
+            )
+            setattr(self, cachename, obj)
+        return getattr(self, cachename)
+
+    def _get_field_expression_map(self, meta, exclude=None):
+        if exclude is None:
+            exclude = set()
+        meta = meta or self._meta
+        field_map = {}
+        generated_fields = []
+        for field in meta.local_fields:
+            if field.name in exclude:
+                continue
+            if field.generated:
+                if any(
+                    ref[0] in exclude
+                    for ref in self._get_expr_references(field.expression)
+                ):
+                    continue
+                generated_fields.append(field)
+                continue
+            if (
+                isinstance(field.remote_field, ForeignObjectRel)
+                and field not in meta.local_concrete_fields
+            ):
+                value = tuple(
+                    getattr(self, from_field) for from_field in field.from_fields
+                )
+                if len(value) == 1:
+                    value = value[0]
+            elif field.concrete:
+                value = getattr(self, field.attname)
+            else:
+                continue
+            if not value or not hasattr(value, "resolve_expression"):
+                value = Value(value, field)
+            field_map[field.name] = value
+            field_map[field.attname] = value
+        if "pk" not in exclude:
+            field_map["pk"] = Value(self.pk, meta.pk)
+        if generated_fields:
+            replacements = {F(name): value for name, value in field_map.items()}
+            for generated_field in generated_fields:
+                field_map[generated_field.name] = ExpressionWrapper(
+                    generated_field.expression.replace_expressions(replacements),
+                    generated_field.output_field,
+                )
+
+        return field_map
+
+    def prepare_database_save(self, field):
+        if not self._is_pk_set():
+            raise ValueError(
+                "Unsaved model instance %r cannot be used in an ORM query." % self
+            )
+        return getattr(self, field.remote_field.get_related_field().attname)
+
+    def clean(self):
+        """
+        Hook for doing any extra model-wide validation after clean() has been
+        called on every field by self.clean_fields. Any ValidationError raised
+        by this method will not be associated with a particular field; it will
+        have a special-case association with the field defined by
+        NON_FIELD_ERRORS.
+        """
+        pass
+
+    def validate_unique(self, exclude=None):
+        """
+        Check unique constraints on the model and raise ValidationError if any
+        failed.
+        """
+        unique_checks, date_checks = self._get_unique_checks(exclude=exclude)
+
+        errors = self._perform_unique_checks(unique_checks)
+        date_errors = self._perform_date_checks(date_checks)
+
+        for k, v in date_errors.items():
+            errors.setdefault(k, []).extend(v)
+
+        if errors:
+            raise ValidationError(errors)
+
+    def _get_unique_checks(self, exclude=None, include_meta_constraints=False):
+        """
+        Return a list of checks to perform. Since validate_unique() could be
+        called from a ModelForm, some fields may have been excluded; we can't
+        perform a unique check on a model that is missing fields involved
+        in that check. Fields that did not validate should also be excluded,
+        but they need to be passed in via the exclude argument.
+        """
+        if exclude is None:
+            exclude = set()
+        unique_checks = []
+
+        unique_togethers = [(self.__class__, self._meta.unique_together)]
+        constraints = []
+        if include_meta_constraints:
+            constraints = [(self.__class__, self._meta.total_unique_constraints)]
+        for parent_class in self._meta.all_parents:
+            if parent_class._meta.unique_together:
+                unique_togethers.append(
+                    (parent_class, parent_class._meta.unique_together)
+                )
+            if include_meta_constraints and parent_class._meta.total_unique_constraints:
+                constraints.append(
+                    (parent_class, parent_class._meta.total_unique_constraints)
+                )
+
+        for model_class, unique_together in unique_togethers:
+            for check in unique_together:
+                if not any(name in exclude for name in check):
+                    # Add the check if the field isn't excluded.
+                    unique_checks.append((model_class, tuple(check)))
+
+        if include_meta_constraints:
+            for model_class, model_constraints in constraints:
+                for constraint in model_constraints:
+                    if not any(name in exclude for name in constraint.fields):
+                        unique_checks.append((model_class, constraint.fields))
+
+        # These are checks for the unique_for_<date/year/month>.
+        date_checks = []
+
+        # Gather a list of checks for fields declared as unique and add them to
+        # the list of checks.
+
+        fields_with_class = [(self.__class__, self._meta.local_fields)]
+        for parent_class in self._meta.all_parents:
+            fields_with_class.append((parent_class, parent_class._meta.local_fields))
+
+        for model_class, fields in fields_with_class:
+            for f in fields:
+                name = f.name
+                if name in exclude:
+                    continue
+                if isinstance(f, CompositePrimaryKey):
+                    names = tuple(field.name for field in f.fields)
+                    if exclude.isdisjoint(names):
+                        unique_checks.append((model_class, names))
+                    continue
+                if f.unique:
+                    unique_checks.append((model_class, (name,)))
+                if f.unique_for_date and f.unique_for_date not in exclude:
+                    date_checks.append((model_class, "date", name, f.unique_for_date))
+                if f.unique_for_year and f.unique_for_year not in exclude:
+                    date_checks.append((model_class, "year", name, f.unique_for_year))
+                if f.unique_for_month and f.unique_for_month not in exclude:
+                    date_checks.append((model_class, "month", name, f.unique_for_month))
+        return unique_checks, date_checks
+
+    def _perform_unique_checks(self, unique_checks):
+        errors = {}
+
+        for model_class, unique_check in unique_checks:
+            # Try to look up an existing object with the same values as this
+            # object's values for all the unique field.
+
+            lookup_kwargs = {}
+            for field_name in unique_check:
+                f = self._meta.get_field(field_name)
+                lookup_value = getattr(self, f.attname)
+                # TODO: Handle multiple backends with different feature flags.
+                if lookup_value is None or (
+                    lookup_value == ""
+                    and connection.features.interprets_empty_strings_as_nulls
+                ):
+                    # no value, skip the lookup
+                    continue
+                if f in model_class._meta.pk_fields and not self._state.adding:
+                    # no need to check for unique primary key when editing
+                    continue
+                lookup_kwargs[str(field_name)] = lookup_value
+
+            # some fields were skipped, no reason to do the check
+            if len(unique_check) != len(lookup_kwargs):
+                continue
+
+            qs = model_class._default_manager.filter(**lookup_kwargs)
+
+            # Exclude the current object from the query if we are editing an
+            # instance (as opposed to creating a new one)
+            # Note that we need to use the pk as defined by model_class, not
+            # self.pk. These can be different fields because model inheritance
+            # allows single model to have effectively multiple primary keys.
+            # Refs #17615.
+            model_class_pk = self._get_pk_val(model_class._meta)
+            if not self._state.adding and self._is_pk_set(model_class._meta):
+                qs = qs.exclude(pk=model_class_pk)
+            if qs.exists():
+                if len(unique_check) == 1:
+                    key = unique_check[0]
+                else:
+                    key = NON_FIELD_ERRORS
+                errors.setdefault(key, []).append(
+                    self.unique_error_message(model_class, unique_check)
+                )
+
+        return errors
+
+    def _perform_date_checks(self, date_checks):
+        errors = {}
+        for model_class, lookup_type, field, unique_for in date_checks:
+            lookup_kwargs = {}
+            # there's a ticket to add a date lookup, we can remove this special
+            # case if that makes it's way in
+            date = getattr(self, unique_for)
+            if date is None:
+                continue
+            if lookup_type == "date":
+                lookup_kwargs["%s__day" % unique_for] = date.day
+                lookup_kwargs["%s__month" % unique_for] = date.month
+                lookup_kwargs["%s__year" % unique_for] = date.year
+            else:
+                lookup_kwargs["%s__%s" % (unique_for, lookup_type)] = getattr(
+                    date, lookup_type
+                )
+            lookup_kwargs[field] = getattr(self, field)
+
+            qs = model_class._default_manager.filter(**lookup_kwargs)
+            # Exclude the current object from the query if we are editing an
+            # instance (as opposed to creating a new one)
+            if not self._state.adding and self._is_pk_set():
+                qs = qs.exclude(pk=self.pk)
+
+            if qs.exists():
+                errors.setdefault(field, []).append(
+                    self.date_error_message(lookup_type, field, unique_for)
+                )
+        return errors
+
+    def date_error_message(self, lookup_type, field_name, unique_for):
+        opts = self._meta
+        field = opts.get_field(field_name)
+        return ValidationError(
+            message=field.error_messages["unique_for_date"],
+            code="unique_for_date",
+            params={
+                "model": self,
+                "model_name": capfirst(opts.verbose_name),
+                "lookup_type": lookup_type,
+                "field": field_name,
+                "field_label": capfirst(field.verbose_name),
+                "date_field": unique_for,
+                "date_field_label": capfirst(opts.get_field(unique_for).verbose_name),
+            },
+        )
+
+    def unique_error_message(self, model_class, unique_check):
+        opts = model_class._meta
+
+        params = {
+            "model": self,
+            "model_class": model_class,
+            "model_name": capfirst(opts.verbose_name),
+            "unique_check": unique_check,
+        }
+
+        # A unique field
+        if len(unique_check) == 1:
+            field = opts.get_field(unique_check[0])
+            params["field_label"] = capfirst(field.verbose_name)
+            return ValidationError(
+                message=field.error_messages["unique"],
+                code="unique",
+                params=params,
+            )
+
+        # unique_together
+        else:
+            field_labels = [
+                capfirst(opts.get_field(f).verbose_name) for f in unique_check
+            ]
+            params["field_labels"] = get_text_list(field_labels, _("and"))
+            return ValidationError(
+                message=_("%(model_name)s with this %(field_labels)s already exists."),
+                code="unique_together",
+                params=params,
+            )
+
+    def get_constraints(self):
+        constraints = [(self.__class__, self._meta.constraints)]
+        for parent_class in self._meta.all_parents:
+            if parent_class._meta.constraints:
+                constraints.append((parent_class, parent_class._meta.constraints))
+        return constraints
+
+    def validate_constraints(self, exclude=None):
+        constraints = self.get_constraints()
+        using = router.db_for_write(self.__class__, instance=self)
+
+        errors = {}
+        for model_class, model_constraints in constraints:
+            for constraint in model_constraints:
+                try:
+                    constraint.validate(model_class, self, exclude=exclude, using=using)
+                except ValidationError as e:
+                    if (
+                        getattr(e, "code", None) == "unique"
+                        and len(constraint.fields) == 1
+                    ):
+                        errors.setdefault(constraint.fields[0], []).append(e)
+                    else:
+                        errors = e.update_error_dict(errors)
+        if errors:
+            raise ValidationError(errors)
+
+    def full_clean(self, exclude=None, validate_unique=True, validate_constraints=True):
+        """
+        Call clean_fields(), clean(), validate_unique(), and
+        validate_constraints() on the model. Raise a ValidationError for any
+        errors that occur.
+        """
+        errors = {}
+        if exclude is None:
+            exclude = set()
+        else:
+            exclude = set(exclude)
+
+        try:
+            self.clean_fields(exclude=exclude)
+        except ValidationError as e:
+            errors = e.update_error_dict(errors)
+
+        # Form.clean() is run even if other validation fails, so do the
+        # same with Model.clean() for consistency.
+        try:
+            self.clean()
+        except ValidationError as e:
+            errors = e.update_error_dict(errors)
+
+        # Run unique checks, but only for fields that passed validation.
+        if validate_unique:
+            for name in errors:
+                if name != NON_FIELD_ERRORS and name not in exclude:
+                    exclude.add(name)
+            try:
+                self.validate_unique(exclude=exclude)
+            except ValidationError as e:
+                errors = e.update_error_dict(errors)
+
+        # Run constraints checks, but only for fields that passed validation.
+        if validate_constraints:
+            for name in errors:
+                if name != NON_FIELD_ERRORS and name not in exclude:
+                    exclude.add(name)
+            try:
+                self.validate_constraints(exclude=exclude)
+            except ValidationError as e:
+                errors = e.update_error_dict(errors)
+
+        if errors:
+            raise ValidationError(errors)
+
+    def clean_fields(self, exclude=None):
+        """
+        Clean all fields and raise a ValidationError containing a dict
+        of all validation errors if any occur.
+        """
+        if exclude is None:
+            exclude = set()
+
+        errors = {}
+        for f in self._meta.fields:
+            if f.name in exclude or f.generated:
+                continue
+            # Skip validation for empty fields with blank=True. The developer
+            # is responsible for making sure they have a valid value.
+            raw_value = getattr(self, f.attname)
+            if f.blank and raw_value in f.empty_values:
+                continue
+            # Skip validation for empty fields when db_default is used.
+            if isinstance(raw_value, DatabaseDefault):
+                continue
+            try:
+                setattr(self, f.attname, f.clean(raw_value, self))
+            except ValidationError as e:
+                errors[f.name] = e.error_list
+
+        if errors:
+            raise ValidationError(errors)
+
+    @classmethod
+    def check(cls, **kwargs):
+        errors = [
+            *cls._check_swappable(),
+            *cls._check_model(),
+            *cls._check_managers(**kwargs),
+        ]
+        if not cls._meta.swapped:
+            databases = kwargs.get("databases") or []
+            errors += [
+                *cls._check_fields(**kwargs),
+                *cls._check_m2m_through_same_relationship(),
+                *cls._check_long_column_names(databases),
+                *cls._check_related_fields(),
+            ]
+            clash_errors = (
+                *cls._check_id_field(),
+                *cls._check_field_name_clashes(),
+                *cls._check_model_name_db_lookup_clashes(),
+                *cls._check_property_name_related_field_accessor_clashes(),
+                *cls._check_single_primary_key(),
+            )
+            errors.extend(clash_errors)
+            # If there are field name clashes, hide consequent column name
+            # clashes.
+            if not clash_errors:
+                errors.extend(cls._check_column_name_clashes())
+            errors += [
+                *cls._check_unique_together(),
+                *cls._check_indexes(databases),
+                *cls._check_ordering(),
+                *cls._check_constraints(databases),
+                *cls._check_db_table_comment(databases),
+                *cls._check_composite_pk(),
+            ]
+
+        return errors
+
+    @classmethod
+    def _check_composite_pk(cls):
+        errors = []
+        meta = cls._meta
+        pk = meta.pk
+
+        if meta.proxy or not isinstance(pk, CompositePrimaryKey):
+            return errors
+
+        seen_columns = defaultdict(list)
+
+        for field_name in pk.field_names:
+            hint = None
+
+            try:
+                field = meta.get_field(field_name)
+            except FieldDoesNotExist:
+                field = None
+
+            if not field:
+                hint = f"{field_name!r} is not a valid field."
+            elif not field.column:
+                hint = f"{field_name!r} field has no column."
+            elif field.null:
+                hint = f"{field_name!r} field may not set 'null=True'."
+            elif field.generated:
+                hint = f"{field_name!r} field is a generated field."
+            elif field not in meta.local_fields:
+                hint = f"{field_name!r} field is not a local field."
+            else:
+                seen_columns[field.column].append(field_name)
+
+            if hint:
+                errors.append(
+                    checks.Error(
+                        f"{field_name!r} cannot be included in the composite primary "
+                        "key.",
+                        hint=hint,
+                        obj=cls,
+                        id="models.E042",
+                    )
+                )
+
+        for column, field_names in seen_columns.items():
+            if len(field_names) > 1:
+                field_name, *rest = field_names
+                duplicates = ", ".join(repr(field) for field in rest)
+                errors.append(
+                    checks.Error(
+                        f"{duplicates} cannot be included in the composite primary "
+                        "key.",
+                        hint=f"{duplicates} and {field_name!r} are the same fields.",
+                        obj=cls,
+                        id="models.E042",
+                    )
+                )
+
+        return errors
+
+    @classmethod
+    def _check_db_table_comment(cls, databases):
+        if not cls._meta.db_table_comment:
+            return []
+        errors = []
+        for db in databases:
+            if not router.allow_migrate_model(db, cls):
+                continue
+            connection = connections[db]
+            if not (
+                connection.features.supports_comments
+                or "supports_comments" in cls._meta.required_db_features
+            ):
+                errors.append(
+                    checks.Warning(
+                        f"{connection.display_name} does not support comments on "
+                        f"tables (db_table_comment).",
+                        obj=cls,
+                        id="models.W046",
+                    )
+                )
+        return errors
+
+    @classmethod
+    def _check_swappable(cls):
+        """Check if the swapped model exists."""
+        errors = []
+        if cls._meta.swapped:
+            try:
+                apps.get_model(cls._meta.swapped)
+            except ValueError:
+                errors.append(
+                    checks.Error(
+                        "'%s' is not of the form 'app_label.app_name'."
+                        % cls._meta.swappable,
+                        id="models.E001",
+                    )
+                )
+            except LookupError:
+                app_label, model_name = cls._meta.swapped.split(".")
+                errors.append(
+                    checks.Error(
+                        "'%s' references '%s.%s', which has not been "
+                        "installed, or is abstract."
+                        % (cls._meta.swappable, app_label, model_name),
+                        id="models.E002",
+                    )
+                )
+        return errors
+
+    @classmethod
+    def _check_model(cls):
+        errors = []
+        if cls._meta.proxy:
+            if cls._meta.local_fields or cls._meta.local_many_to_many:
+                errors.append(
+                    checks.Error(
+                        "Proxy model '%s' contains model fields." % cls.__name__,
+                        id="models.E017",
+                    )
+                )
+        return errors
+
+    @classmethod
+    def _check_managers(cls, **kwargs):
+        """Perform all manager checks."""
+        errors = []
+        for manager in cls._meta.managers:
+            errors.extend(manager.check(**kwargs))
+        return errors
+
+    @classmethod
+    def _check_fields(cls, **kwargs):
+        """Perform all field checks."""
+        errors = []
+        for field in cls._meta.local_fields:
+            errors.extend(field.check(**kwargs))
+        for field in cls._meta.local_many_to_many:
+            errors.extend(field.check(from_model=cls, **kwargs))
+        return errors
+
+    @classmethod
+    def _check_m2m_through_same_relationship(cls):
+        """
+        Check if no relationship model is used by more than one m2m field.
+        """
+
+        errors = []
+        seen_intermediary_signatures = []
+
+        fields = cls._meta.local_many_to_many
+
+        # Skip when the target model wasn't found.
+        fields = (f for f in fields if isinstance(f.remote_field.model, ModelBase))
+
+        # Skip when the relationship model wasn't found.
+        fields = (f for f in fields if isinstance(f.remote_field.through, ModelBase))
+
+        for f in fields:
+            signature = (
+                f.remote_field.model,
+                cls,
+                f.remote_field.through,
+                f.remote_field.through_fields,
+            )
+            if signature in seen_intermediary_signatures:
+                errors.append(
+                    checks.Error(
+                        "The model has two identical many-to-many relations "
+                        "through the intermediate model '%s'."
+                        % f.remote_field.through._meta.label,
+                        obj=cls,
+                        id="models.E003",
+                    )
+                )
+            else:
+                seen_intermediary_signatures.append(signature)
+        return errors
+
+    @classmethod
+    def _check_id_field(cls):
+        """Check if `id` field is a primary key."""
+        fields = [
+            f for f in cls._meta.local_fields if f.name == "id" and f != cls._meta.pk
+        ]
+        # fields is empty or consists of the invalid "id" field
+        if fields and not fields[0].primary_key and cls._meta.pk.name == "id":
+            return [
+                checks.Error(
+                    "'id' can only be used as a field name if the field also "
+                    "sets 'primary_key=True'.",
+                    obj=cls,
+                    id="models.E004",
+                )
+            ]
+        else:
+            return []
+
+    @classmethod
+    def _check_field_name_clashes(cls):
+        """Forbid field shadowing in multi-table inheritance."""
+        errors = []
+        used_fields = {}  # name or attname -> field
+
+        # Check that multi-inheritance doesn't cause field name shadowing.
+        for parent in cls._meta.all_parents:
+            for f in parent._meta.local_fields:
+                clash = used_fields.get(f.name) or used_fields.get(f.attname) or None
+                if clash:
+                    errors.append(
+                        checks.Error(
+                            "The field '%s' from parent model "
+                            "'%s' clashes with the field '%s' "
+                            "from parent model '%s'."
+                            % (clash.name, clash.model._meta, f.name, f.model._meta),
+                            obj=cls,
+                            id="models.E005",
+                        )
+                    )
+                used_fields[f.name] = f
+                used_fields[f.attname] = f
+
+        # Check that fields defined in the model don't clash with fields from
+        # parents, including auto-generated fields like multi-table inheritance
+        # child accessors.
+        for parent in cls._meta.all_parents:
+            for f in parent._meta.get_fields():
+                if f not in used_fields:
+                    used_fields[f.name] = f
+
+        # Check that parent links in diamond-shaped MTI models don't clash.
+        for parent_link in cls._meta.parents.values():
+            if not parent_link:
+                continue
+            clash = used_fields.get(parent_link.name) or None
+            if clash:
+                errors.append(
+                    checks.Error(
+                        f"The field '{parent_link.name}' clashes with the field "
+                        f"'{clash.name}' from model '{clash.model._meta}'.",
+                        obj=cls,
+                        id="models.E006",
+                    )
+                )
+
+        for f in cls._meta.local_fields:
+            clash = used_fields.get(f.name) or used_fields.get(f.attname) or None
+            # Note that we may detect clash between user-defined non-unique
+            # field "id" and automatically added unique field "id", both
+            # defined at the same model. This special case is considered in
+            # _check_id_field and here we ignore it.
+            id_conflict = (
+                f.name == "id" and clash and clash.name == "id" and clash.model == cls
+            )
+            if clash and not id_conflict:
+                errors.append(
+                    checks.Error(
+                        "The field '%s' clashes with the field '%s' "
+                        "from model '%s'." % (f.name, clash.name, clash.model._meta),
+                        obj=f,
+                        id="models.E006",
+                    )
+                )
+            used_fields[f.name] = f
+            used_fields[f.attname] = f
+
+        return errors
+
+    @classmethod
+    def _check_column_name_clashes(cls):
+        # Store a list of column names which have already been used by other
+        # fields.
+        used_column_names = []
+        errors = []
+
+        for f in cls._meta.local_fields:
+            column_name = f.column
+
+            # Ensure the column name is not already in use.
+            if column_name and column_name in used_column_names:
+                errors.append(
+                    checks.Error(
+                        "Field '%s' has column name '%s' that is used by "
+                        "another field." % (f.name, column_name),
+                        hint="Specify a 'db_column' for the field.",
+                        obj=cls,
+                        id="models.E007",
+                    )
+                )
+            else:
+                used_column_names.append(column_name)
+
+        return errors
+
+    @classmethod
+    def _check_model_name_db_lookup_clashes(cls):
+        errors = []
+        model_name = cls.__name__
+        if model_name.startswith("_") or model_name.endswith("_"):
+            errors.append(
+                checks.Error(
+                    "The model name '%s' cannot start or end with an underscore "
+                    "as it collides with the query lookup syntax." % model_name,
+                    obj=cls,
+                    id="models.E023",
+                )
+            )
+        elif LOOKUP_SEP in model_name:
+            errors.append(
+                checks.Error(
+                    "The model name '%s' cannot contain double underscores as "
+                    "it collides with the query lookup syntax." % model_name,
+                    obj=cls,
+                    id="models.E024",
+                )
+            )
+        return errors
+
+    @classmethod
+    def _check_property_name_related_field_accessor_clashes(cls):
+        errors = []
+        property_names = cls._meta._property_names
+        related_field_accessors = (
+            f.attname
+            for f in cls._meta._get_fields(reverse=False)
+            if f.is_relation and f.related_model is not None
+        )
+        for accessor in related_field_accessors:
+            if accessor in property_names:
+                errors.append(
+                    checks.Error(
+                        "The property '%s' clashes with a related field "
+                        "accessor." % accessor,
+                        obj=cls,
+                        id="models.E025",
+                    )
+                )
+        return errors
+
+    @classmethod
+    def _check_single_primary_key(cls):
+        errors = []
+        if sum(1 for f in cls._meta.local_fields if f.primary_key) > 1:
+            errors.append(
+                checks.Error(
+                    "The model cannot have more than one field with "
+                    "'primary_key=True'.",
+                    obj=cls,
+                    id="models.E026",
+                )
+            )
+        return errors
+
+    @classmethod
+    def _check_unique_together(cls):
+        """Check the value of "unique_together" option."""
+        if not isinstance(cls._meta.unique_together, (tuple, list)):
+            return [
+                checks.Error(
+                    "'unique_together' must be a list or tuple.",
+                    obj=cls,
+                    id="models.E010",
+                )
+            ]
+
+        elif any(
+            not isinstance(fields, (tuple, list))
+            for fields in cls._meta.unique_together
+        ):
+            return [
+                checks.Error(
+                    "All 'unique_together' elements must be lists or tuples.",
+                    obj=cls,
+                    id="models.E011",
+                )
+            ]
+
+        else:
+            errors = []
+            for fields in cls._meta.unique_together:
+                errors.extend(cls._check_local_fields(fields, "unique_together"))
+            return errors
+
+    @classmethod
+    def _check_indexes(cls, databases):
+        errors = []
+        for db in databases:
+            if not router.allow_migrate_model(db, cls):
+                continue
+            connection = connections[db]
+            for index in cls._meta.indexes:
+                errors.extend(index.check(cls, connection))
+        return errors
+
+    @classmethod
+    def _check_local_fields(cls, fields, option):
+        from django.db import models
+
+        # In order to avoid hitting the relation tree prematurely, we use our
+        # own fields_map instead of using get_field()
+        forward_fields_map = {}
+        for field in cls._meta._get_fields(reverse=False):
+            forward_fields_map[field.name] = field
+            if hasattr(field, "attname"):
+                forward_fields_map[field.attname] = field
+
+        errors = []
+        for field_name in fields:
+            try:
+                field = forward_fields_map[field_name]
+            except KeyError:
+                errors.append(
+                    checks.Error(
+                        "'%s' refers to the nonexistent field '%s'."
+                        % (
+                            option,
+                            field_name,
+                        ),
+                        obj=cls,
+                        id="models.E012",
+                    )
+                )
+            else:
+                if isinstance(field.remote_field, models.ManyToManyRel):
+                    errors.append(
+                        checks.Error(
+                            "'%s' refers to a ManyToManyField '%s', but "
+                            "ManyToManyFields are not permitted in '%s'."
+                            % (
+                                option,
+                                field_name,
+                                option,
+                            ),
+                            obj=cls,
+                            id="models.E013",
+                        )
+                    )
+                elif isinstance(field, models.CompositePrimaryKey):
+                    errors.append(
+                        checks.Error(
+                            f"{option!r} refers to a CompositePrimaryKey "
+                            f"{field_name!r}, but CompositePrimaryKeys are not "
+                            f"permitted in {option!r}.",
+                            obj=cls,
+                            id="models.E048",
+                        )
+                    )
+                elif (
+                    isinstance(field.remote_field, ForeignObjectRel)
+                    and field not in cls._meta.local_concrete_fields
+                    and len(field.from_fields) > 1
+                ):
+                    errors.append(
+                        checks.Error(
+                            f"{option!r} refers to a ForeignObject {field_name!r} with "
+                            "multiple 'from_fields', which is not supported for that "
+                            "option.",
+                            obj=cls,
+                            id="models.E049",
+                        )
+                    )
+                elif field not in cls._meta.local_fields:
+                    errors.append(
+                        checks.Error(
+                            "'%s' refers to field '%s' which is not local to model "
+                            "'%s'." % (option, field_name, cls._meta.object_name),
+                            hint="This issue may be caused by multi-table inheritance.",
+                            obj=cls,
+                            id="models.E016",
+                        )
+                    )
+        return errors
+
+    @classmethod
+    def _check_ordering(cls):
+        """
+        Check "ordering" option -- is it a list of strings and do all fields
+        exist?
+        """
+        if cls._meta._ordering_clash:
+            return [
+                checks.Error(
+                    "'ordering' and 'order_with_respect_to' cannot be used together.",
+                    obj=cls,
+                    id="models.E021",
+                ),
+            ]
+
+        if cls._meta.order_with_respect_to or not cls._meta.ordering:
+            return []
+
+        if not isinstance(cls._meta.ordering, (list, tuple)):
+            return [
+                checks.Error(
+                    "'ordering' must be a tuple or list (even if you want to order by "
+                    "only one field).",
+                    obj=cls,
+                    id="models.E014",
+                )
+            ]
+
+        errors = []
+        fields = cls._meta.ordering
+
+        # Skip expressions and '?' fields.
+        fields = (f for f in fields if isinstance(f, str) and f != "?")
+
+        # Convert "-field" to "field".
+        fields = (f.removeprefix("-") for f in fields)
+
+        # Separate related fields and non-related fields.
+        _fields = []
+        related_fields = []
+        for f in fields:
+            if LOOKUP_SEP in f:
+                related_fields.append(f)
+            else:
+                _fields.append(f)
+        fields = _fields
+
+        # Check related fields.
+        for field in related_fields:
+            _cls = cls
+            fld = None
+            for part in field.split(LOOKUP_SEP):
+                try:
+                    # pk is an alias that won't be found by opts.get_field.
+                    if part == "pk":
+                        fld = _cls._meta.pk
+                    else:
+                        fld = _cls._meta.get_field(part)
+                    if fld.is_relation:
+                        _cls = fld.path_infos[-1].to_opts.model
+                    else:
+                        _cls = None
+                except (FieldDoesNotExist, AttributeError):
+                    if fld is None or (
+                        fld.get_transform(part) is None and fld.get_lookup(part) is None
+                    ):
+                        errors.append(
+                            checks.Error(
+                                "'ordering' refers to the nonexistent field, "
+                                "related field, or lookup '%s'." % field,
+                                obj=cls,
+                                id="models.E015",
+                            )
+                        )
+
+        # Skip ordering on pk. This is always a valid order_by field
+        # but is an alias and therefore won't be found by opts.get_field.
+        fields = {f for f in fields if f != "pk"}
+
+        # Check for invalid or nonexistent fields in ordering.
+        invalid_fields = []
+
+        # Any field name that is not present in field_names does not exist.
+        # Also, ordering by m2m fields is not allowed.
+        opts = cls._meta
+        valid_fields = set(
+            chain.from_iterable(
+                (
+                    (f.name, f.attname)
+                    if not (f.auto_created and not f.concrete)
+                    else (f.field.related_query_name(),)
+                )
+                for f in chain(opts.fields, opts.related_objects)
+            )
+        )
+
+        invalid_fields.extend(fields - valid_fields)
+
+        for invalid_field in invalid_fields:
+            errors.append(
+                checks.Error(
+                    "'ordering' refers to the nonexistent field, related "
+                    "field, or lookup '%s'." % invalid_field,
+                    obj=cls,
+                    id="models.E015",
+                )
+            )
+        return errors
+
+    @classmethod
+    def _check_long_column_names(cls, databases):
+        """
+        Check that any auto-generated column names are shorter than the limits
+        for each database in which the model will be created.
+        """
+        if not databases:
+            return []
+        errors = []
+        allowed_len = None
+        db_alias = None
+
+        # Find the minimum max allowed length among all specified db_aliases.
+        for db in databases:
+            # skip databases where the model won't be created
+            if not router.allow_migrate_model(db, cls):
+                continue
+            connection = connections[db]
+            max_name_length = connection.ops.max_name_length()
+            if max_name_length is None or connection.features.truncates_names:
+                continue
+            else:
+                if allowed_len is None:
+                    allowed_len = max_name_length
+                    db_alias = db
+                elif max_name_length < allowed_len:
+                    allowed_len = max_name_length
+                    db_alias = db
+
+        if allowed_len is None:
+            return errors
+
+        for f in cls._meta.local_fields:
+            # Check if auto-generated name for the field is too long
+            # for the database.
+            if (
+                f.db_column is None
+                and (column_name := f.column) is not None
+                and len(column_name) > allowed_len
+            ):
+                errors.append(
+                    checks.Error(
+                        'Autogenerated column name too long for field "%s". '
+                        'Maximum length is "%s" for database "%s".'
+                        % (column_name, allowed_len, db_alias),
+                        hint="Set the column name manually using 'db_column'.",
+                        obj=cls,
+                        id="models.E018",
+                    )
+                )
+
+        for f in cls._meta.local_many_to_many:
+            # Skip nonexistent models.
+            if isinstance(f.remote_field.through, str):
+                continue
+
+            # Check if auto-generated name for the M2M field is too long
+            # for the database.
+            for m2m in f.remote_field.through._meta.local_fields:
+                if (
+                    m2m.db_column is None
+                    and (rel_name := m2m.column) is not None
+                    and len(rel_name) > allowed_len
+                ):
+                    errors.append(
+                        checks.Error(
+                            "Autogenerated column name too long for M2M field "
+                            '"%s". Maximum length is "%s" for database "%s".'
+                            % (rel_name, allowed_len, db_alias),
+                            hint=(
+                                "Use 'through' to create a separate model for "
+                                "M2M and then set column_name using 'db_column'."
+                            ),
+                            obj=cls,
+                            id="models.E019",
+                        )
+                    )
+
+        return errors
+
+    @classmethod
+    def _check_related_fields(cls):
+        has_db_variant = False
+        has_python_variant = False
+        for rel in cls._meta.get_fields():
+            if rel.related_model:
+                if not (on_delete := getattr(rel.remote_field, "on_delete", None)):
+                    continue
+                if isinstance(on_delete, DatabaseOnDelete):
+                    has_db_variant = True
+                elif on_delete != DO_NOTHING:
+                    has_python_variant = True
+                if has_db_variant and has_python_variant:
+                    return [
+                        checks.Error(
+                            "The model cannot have related fields with both "
+                            "database-level and Python-level on_delete variants.",
+                            obj=cls,
+                            id="models.E050",
+                        )
+                    ]
+        return []
+
+    @classmethod
+    def _get_expr_references(cls, expr):
+        if isinstance(expr, Q):
+            for child in expr.children:
+                if isinstance(child, tuple):
+                    lookup, value = child
+                    yield tuple(lookup.split(LOOKUP_SEP))
+                    yield from cls._get_expr_references(value)
+                else:
+                    yield from cls._get_expr_references(child)
+        elif isinstance(expr, F):
+            yield tuple(expr.name.split(LOOKUP_SEP))
+        elif hasattr(expr, "get_source_expressions"):
+            for src_expr in expr.get_source_expressions():
+                yield from cls._get_expr_references(src_expr)
+
+    @classmethod
+    def _check_constraints(cls, databases):
+        errors = []
+        for db in databases:
+            if not router.allow_migrate_model(db, cls):
+                continue
+            connection = connections[db]
+            for constraint in cls._meta.constraints:
+                errors.extend(constraint.check(cls, connection))
+        return errors
+
+
+############################################
+# HELPER FUNCTIONS (CURRIED MODEL METHODS) #
+############################################
+
+# ORDERING METHODS #########################
+
+
+def method_set_order(self, ordered_obj, id_list, using=None):
+    order_wrt = ordered_obj._meta.order_with_respect_to
+    filter_args = order_wrt.get_forward_related_filter(self)
+    ordered_obj.objects.db_manager(using).filter(**filter_args).bulk_update(
+        [ordered_obj(pk=pk, _order=order) for order, pk in enumerate(id_list)],
+        ["_order"],
+    )
+
+
+def method_get_order(self, ordered_obj):
+    order_wrt = ordered_obj._meta.order_with_respect_to
+    filter_args = order_wrt.get_forward_related_filter(self)
+    pk_name = ordered_obj._meta.pk.name
+    return ordered_obj.objects.filter(**filter_args).values_list(pk_name, flat=True)
+
+
+def make_foreign_order_accessors(model, related_model):
+    setattr(
+        related_model,
+        "get_%s_order" % model.__name__.lower(),
+        partialmethod(method_get_order, model),
+    )
+    setattr(
+        related_model,
+        "set_%s_order" % model.__name__.lower(),
+        partialmethod(method_set_order, model),
+    )
+
+
+########
+# MISC #
+########
+
+
+def model_unpickle(model_id):
+    """Used to unpickle Model subclasses with deferred fields."""
+    if isinstance(model_id, tuple):
+        model = apps.get_model(*model_id)
+    else:
+        # Backwards compat - the model was cached directly in earlier versions.
+        model = model_id
+    return model.__new__(model)
+
+
+model_unpickle.__safe_for_unpickle__ = True
+from __future__ import annotations
+
+import collections.abc as c
+import hashlib
+import typing as t
+from collections.abc import MutableMapping
+from datetime import datetime
+from datetime import timezone
+
+from itsdangerous import BadSignature
+from itsdangerous import URLSafeTimedSerializer
+from werkzeug.datastructures import CallbackDict
+
+from .json.tag import TaggedJSONSerializer
+
+if t.TYPE_CHECKING:  # pragma: no cover
+    import typing_extensions as te
+
+    from .app import Flask
+    from .wrappers import Request
+    from .wrappers import Response
+
+
+class SessionMixin(MutableMapping[str, t.Any]):
+    """Expands a basic dictionary with session attributes."""
+
+    @property
+    def permanent(self) -> bool:
+        """This reflects the ``'_permanent'`` key in the dict."""
+        return self.get("_permanent", False)  # type: ignore[no-any-return]
+
+    @permanent.setter
+    def permanent(self, value: bool) -> None:
+        self["_permanent"] = bool(value)
+
+    #: Some implementations can detect whether a session is newly
+    #: created, but that is not guaranteed. Use with caution. The mixin
+    # default is hard-coded ``False``.
+    new = False
+
+    #: Some implementations can detect changes to the session and set
+    #: this when that happens. The mixin default is hard coded to
+    #: ``True``.
+    modified = True
+
+    accessed = False
+    """Indicates if the session was accessed, even if it was not modified. This
+    is set when the session object is accessed through the request context,
+    including the global :data:`.session` proxy. A ``Vary: cookie`` header will
+    be added if this is ``True``.
+
+    .. versionchanged:: 3.1.3
+        This is tracked by the request context.
+    """
+
+
+class SecureCookieSession(CallbackDict[str, t.Any], SessionMixin):
+    """Base class for sessions based on signed cookies.
+
+    This session backend will set the :attr:`modified` and
+    :attr:`accessed` attributes. It cannot reliably track whether a
+    session is new (vs. empty), so :attr:`new` remains hard coded to
+    ``False``.
+    """
+
+    #: When data is changed, this is set to ``True``. Only the session
+    #: dictionary itself is tracked; if the session contains mutable
+    #: data (for example a nested dict) then this must be set to
+    #: ``True`` manually when modifying that data. The session cookie
+    #: will only be written to the response if this is ``True``.
+    modified = False
+
+    def __init__(
+        self,
+        initial: c.Mapping[str, t.Any] | None = None,
+    ) -> None:
+        def on_update(self: te.Self) -> None:
+            self.modified = True
+
+        super().__init__(initial, on_update)
+
+
+class NullSession(SecureCookieSession):
+    """Class used to generate nicer error messages if sessions are not
+    available.  Will still allow read-only access to the empty session
+    but fail on setting.
+    """
+
+    def _fail(self, *args: t.Any, **kwargs: t.Any) -> t.NoReturn:
+        raise RuntimeError(
+            "The session is unavailable because no secret "
+            "key was set.  Set the secret_key on the "
+            "application to something unique and secret."
+        )
+
+    __setitem__ = __delitem__ = clear = pop = popitem = update = setdefault = _fail
+    del _fail
+
+
+class SessionInterface:
+    """The basic interface you have to implement in order to replace the
+    default session interface which uses werkzeug's securecookie
+    implementation.  The only methods you have to implement are
+    :meth:`open_session` and :meth:`save_session`, the others have
+    useful defaults which you don't need to change.
+
+    The session object returned by the :meth:`open_session` method has to
+    provide a dictionary like interface plus the properties and methods
+    from the :class:`SessionMixin`.  We recommend just subclassing a dict
+    and adding that mixin::
+
+        class Session(dict, SessionMixin):
+            pass
+
+    If :meth:`open_session` returns ``None`` Flask will call into
+    :meth:`make_null_session` to create a session that acts as replacement
+    if the session support cannot work because some requirement is not
+    fulfilled.  The default :class:`NullSession` class that is created
+    will complain that the secret key was not set.
+
+    To replace the session interface on an application all you have to do
+    is to assign :attr:`flask.Flask.session_interface`::
+
+        app = Flask(__name__)
+        app.session_interface = MySessionInterface()
+
+    Multiple requests with the same session may be sent and handled
+    concurrently. When implementing a new session interface, consider
+    whether reads or writes to the backing store must be synchronized.
+    There is no guarantee on the order in which the session for each
+    request is opened or saved, it will occur in the order that requests
+    begin and end processing.
+
+    .. versionadded:: 0.8
+    """
+
+    #: :meth:`make_null_session` will look here for the class that should
+    #: be created when a null session is requested.  Likewise the
+    #: :meth:`is_null_session` method will perform a typecheck against
+    #: this type.
+    null_session_class = NullSession
+
+    #: A flag that indicates if the session interface is pickle based.
+    #: This can be used by Flask extensions to make a decision in regards
+    #: to how to deal with the session object.
+    #:
+    #: .. versionadded:: 0.10
+    pickle_based = False
+
+    def make_null_session(self, app: Flask) -> NullSession:
+        """Creates a null session which acts as a replacement object if the
+        real session support could not be loaded due to a configuration
+        error.  This mainly aids the user experience because the job of the
+        null session is to still support lookup without complaining but
+        modifications are answered with a helpful error message of what
+        failed.
+
+        This creates an instance of :attr:`null_session_class` by default.
+        """
+        return self.null_session_class()
+
+    def is_null_session(self, obj: object) -> bool:
+        """Checks if a given object is a null session.  Null sessions are
+        not asked to be saved.
+
+        This checks if the object is an instance of :attr:`null_session_class`
+        by default.
+        """
+        return isinstance(obj, self.null_session_class)
+
+    def get_cookie_name(self, app: Flask) -> str:
+        """The name of the session cookie. Uses``app.config["SESSION_COOKIE_NAME"]``."""
+        return app.config["SESSION_COOKIE_NAME"]  # type: ignore[no-any-return]
+
+    def get_cookie_domain(self, app: Flask) -> str | None:
+        """The value of the ``Domain`` parameter on the session cookie. If not set,
+        browsers will only send the cookie to the exact domain it was set from.
+        Otherwise, they will send it to any subdomain of the given value as well.
+
+        Uses the :data:`SESSION_COOKIE_DOMAIN` config.
+
+        .. versionchanged:: 2.3
+            Not set by default, does not fall back to ``SERVER_NAME``.
+        """
+        return app.config["SESSION_COOKIE_DOMAIN"]  # type: ignore[no-any-return]
+
+    def get_cookie_path(self, app: Flask) -> str:
+        """Returns the path for which the cookie should be valid.  The
+        default implementation uses the value from the ``SESSION_COOKIE_PATH``
+        config var if it's set, and falls back to ``APPLICATION_ROOT`` or
+        uses ``/`` if it's ``None``.
+        """
+        return app.config["SESSION_COOKIE_PATH"] or app.config["APPLICATION_ROOT"]  # type: ignore[no-any-return]
+
+    def get_cookie_httponly(self, app: Flask) -> bool:
+        """Returns True if the session cookie should be httponly.  This
+        currently just returns the value of the ``SESSION_COOKIE_HTTPONLY``
+        config var.
+        """
+        return app.config["SESSION_COOKIE_HTTPONLY"]  # type: ignore[no-any-return]
+
+    def get_cookie_secure(self, app: Flask) -> bool:
+        """Returns True if the cookie should be secure.  This currently
+        just returns the value of the ``SESSION_COOKIE_SECURE`` setting.
+        """
+        return app.config["SESSION_COOKIE_SECURE"]  # type: ignore[no-any-return]
+
+    def get_cookie_samesite(self, app: Flask) -> str | None:
+        """Return ``'Strict'`` or ``'Lax'`` if the cookie should use the
+        ``SameSite`` attribute. This currently just returns the value of
+        the :data:`SESSION_COOKIE_SAMESITE` setting.
+        """
+        return app.config["SESSION_COOKIE_SAMESITE"]  # type: ignore[no-any-return]
+
+    def get_cookie_partitioned(self, app: Flask) -> bool:
+        """Returns True if the cookie should be partitioned. By default, uses
+        the value of :data:`SESSION_COOKIE_PARTITIONED`.
+
+        .. versionadded:: 3.1
+        """
+        return app.config["SESSION_COOKIE_PARTITIONED"]  # type: ignore[no-any-return]
+
+    def get_expiration_time(self, app: Flask, session: SessionMixin) -> datetime | None:
+        """A helper method that returns an expiration date for the session
+        or ``None`` if the session is linked to the browser session.  The
+        default implementation returns now + the permanent session
+        lifetime configured on the application.
+        """
+        if session.permanent:
+            return datetime.now(timezone.utc) + app.permanent_session_lifetime
+        return None
+
+    def should_set_cookie(self, app: Flask, session: SessionMixin) -> bool:
+        """Used by session backends to determine if a ``Set-Cookie`` header
+        should be set for this session cookie for this response. If the session
+        has been modified, the cookie is set. If the session is permanent and
+        the ``SESSION_REFRESH_EACH_REQUEST`` config is true, the cookie is
+        always set.
+
+        This check is usually skipped if the session was deleted.
+
+        .. versionadded:: 0.11
+        """
+
+        return session.modified or (
+            session.permanent and app.config["SESSION_REFRESH_EACH_REQUEST"]
+        )
+
+    def open_session(self, app: Flask, request: Request) -> SessionMixin | None:
+        """This is called at the beginning of each request, after
+        pushing the request context, before matching the URL.
+
+        This must return an object which implements a dictionary-like
+        interface as well as the :class:`SessionMixin` interface.
+
+        This will return ``None`` to indicate that loading failed in
+        some way that is not immediately an error. The request
+        context will fall back to using :meth:`make_null_session`
+        in this case.
+        """
+        raise NotImplementedError()
+
+    def save_session(
+        self, app: Flask, session: SessionMixin, response: Response
+    ) -> None:
+        """This is called at the end of each request, after generating
+        a response, before removing the request context. It is skipped
+        if :meth:`is_null_session` returns ``True``.
+        """
+        raise NotImplementedError()
+
+
+session_json_serializer = TaggedJSONSerializer()
+
+
+def _lazy_sha1(string: bytes = b"") -> t.Any:
+    """Don't access ``hashlib.sha1`` until runtime. FIPS builds may not include
+    SHA-1, in which case the import and use as a default would fail before the
+    developer can configure something else.
+    """
+    return hashlib.sha1(string)
+
+
+class SecureCookieSessionInterface(SessionInterface):
+    """The default session interface that stores sessions in signed cookies
+    through the :mod:`itsdangerous` module.
+    """
+
+    #: the salt that should be applied on top of the secret key for the
+    #: signing of cookie based sessions.
+    salt = "cookie-session"
+    #: the hash function to use for the signature.  The default is sha1
+    digest_method = staticmethod(_lazy_sha1)
+    #: the name of the itsdangerous supported key derivation.  The default
+    #: is hmac.
+    key_derivation = "hmac"
+    #: A python serializer for the payload.  The default is a compact
+    #: JSON derived serializer with support for some extra Python types
+    #: such as datetime objects or tuples.
+    serializer = session_json_serializer
+    session_class = SecureCookieSession
+
+    def get_signing_serializer(self, app: Flask) -> URLSafeTimedSerializer | None:
+        if not app.secret_key:
+            return None
+
+        keys: list[str | bytes] = []
+
+        if fallbacks := app.config["SECRET_KEY_FALLBACKS"]:
+            keys.extend(fallbacks)
+
+        keys.append(app.secret_key)  # itsdangerous expects current key at top
+        return URLSafeTimedSerializer(
+            keys,  # type: ignore[arg-type]
+            salt=self.salt,
+            serializer=self.serializer,
+            signer_kwargs={
+                "key_derivation": self.key_derivation,
+                "digest_method": self.digest_method,
+            },
+        )
+
+    def open_session(self, app: Flask, request: Request) -> SecureCookieSession | None:
+        s = self.get_signing_serializer(app)
+        if s is None:
+            return None
+        val = request.cookies.get(self.get_cookie_name(app))
+        if not val:
+            return self.session_class()
+        max_age = int(app.permanent_session_lifetime.total_seconds())
+        try:
+            data = s.loads(val, max_age=max_age)
+            return self.session_class(data)
+        except BadSignature:
+            return self.session_class()
+
+    def save_session(
+        self, app: Flask, session: SessionMixin, response: Response
+    ) -> None:
+        name = self.get_cookie_name(app)
+        domain = self.get_cookie_domain(app)
+        path = self.get_cookie_path(app)
+        secure = self.get_cookie_secure(app)
+        partitioned = self.get_cookie_partitioned(app)
+        samesite = self.get_cookie_samesite(app)
+        httponly = self.get_cookie_httponly(app)
+
+        # Add a "Vary: Cookie" header if the session was accessed at all.
+        if session.accessed:
+            response.vary.add("Cookie")
+
+        # If the session is modified to be empty, remove the cookie.
+        # If the session is empty, return without setting the cookie.
+        if not session:
+            if session.modified:
+                response.delete_cookie(
+                    name,
+                    domain=domain,
+                    path=path,
+                    secure=secure,
+                    partitioned=partitioned,
+                    samesite=samesite,
+                    httponly=httponly,
+                )
+                response.vary.add("Cookie")
+
+            return
+
+        if not self.should_set_cookie(app, session):
+            return
+
+        expires = self.get_expiration_time(app, session)
+        val = self.get_signing_serializer(app).dumps(dict(session))  # type: ignore[union-attr]
+        response.set_cookie(
+            name,
+            val,
+            expires=expires,
+            httponly=httponly,
+            domain=domain,
+            path=path,
+            secure=secure,
+            partitioned=partitioned,
+            samesite=samesite,
+        )
+        response.vary.add("Cookie")
+
+from __future__ import annotations
+
+import typing as t
+
+from werkzeug.exceptions import BadRequest
+from werkzeug.exceptions import HTTPException
+from werkzeug.wrappers import Request as RequestBase
+from werkzeug.wrappers import Response as ResponseBase
+
+from . import json
+from .globals import current_app
+from .helpers import _split_blueprint_path
+
+if t.TYPE_CHECKING:  # pragma: no cover
+    from werkzeug.routing import Rule
+
+
+class Request(RequestBase):
+    """The request object used by default in Flask.  Remembers the
+    matched endpoint and view arguments.
+
+    It is what ends up as :class:`~flask.request`.  If you want to replace
+    the request object used you can subclass this and set
+    :attr:`~flask.Flask.request_class` to your subclass.
+
+    The request object is a :class:`~werkzeug.wrappers.Request` subclass and
+    provides all of the attributes Werkzeug defines plus a few Flask
+    specific ones.
+    """
+
+    json_module: t.Any = json
+
+    #: The internal URL rule that matched the request.  This can be
+    #: useful to inspect which methods are allowed for the URL from
+    #: a before/after handler (``request.url_rule.methods``) etc.
+    #: Though if the request's method was invalid for the URL rule,
+    #: the valid list is available in ``routing_exception.valid_methods``
+    #: instead (an attribute of the Werkzeug exception
+    #: :exc:`~werkzeug.exceptions.MethodNotAllowed`)
+    #: because the request was never internally bound.
+    #:
+    #: .. versionadded:: 0.6
+    url_rule: Rule | None = None
+
+    #: A dict of view arguments that matched the request.  If an exception
+    #: happened when matching, this will be ``None``.
+    view_args: dict[str, t.Any] | None = None
+
+    #: If matching the URL failed, this is the exception that will be
+    #: raised / was raised as part of the request handling.  This is
+    #: usually a :exc:`~werkzeug.exceptions.NotFound` exception or
+    #: something similar.
+    routing_exception: HTTPException | None = None
+
+    _max_content_length: int | None = None
+    _max_form_memory_size: int | None = None
+    _max_form_parts: int | None = None
+
+    @property
+    def max_content_length(self) -> int | None:
+        """The maximum number of bytes that will be read during this request. If
+        this limit is exceeded, a 413 :exc:`~werkzeug.exceptions.RequestEntityTooLarge`
+        error is raised. If it is set to ``None``, no limit is enforced at the
+        Flask application level. However, if it is ``None`` and the request has
+        no ``Content-Length`` header and the WSGI server does not indicate that
+        it terminates the stream, then no data is read to avoid an infinite
+        stream.
+
+        Each request defaults to the :data:`MAX_CONTENT_LENGTH` config, which
+        defaults to ``None``. It can be set on a specific ``request`` to apply
+        the limit to that specific view. This should be set appropriately based
+        on an application's or view's specific needs.
+
+        .. versionchanged:: 3.1
+            This can be set per-request.
+
+        .. versionchanged:: 0.6
+            This is configurable through Flask config.
+        """
+        if self._max_content_length is not None:
+            return self._max_content_length
+
+        if not current_app:
+            return super().max_content_length
+
+        return current_app.config["MAX_CONTENT_LENGTH"]  # type: ignore[no-any-return]
+
+    @max_content_length.setter
+    def max_content_length(self, value: int | None) -> None:
+        self._max_content_length = value
+
+    @property
+    def max_form_memory_size(self) -> int | None:
+        """The maximum size in bytes any non-file form field may be in a
+        ``multipart/form-data`` body. If this limit is exceeded, a 413
+        :exc:`~werkzeug.exceptions.RequestEntityTooLarge` error is raised. If it
+        is set to ``None``, no limit is enforced at the Flask application level.
+
+        Each request defaults to the :data:`MAX_FORM_MEMORY_SIZE` config, which
+        defaults to ``500_000``. It can be set on a specific ``request`` to
+        apply the limit to that specific view. This should be set appropriately
+        based on an application's or view's specific needs.
+
+        .. versionchanged:: 3.1
+            This is configurable through Flask config.
+        """
+        if self._max_form_memory_size is not None:
+            return self._max_form_memory_size
+
+        if not current_app:
+            return super().max_form_memory_size
+
+        return current_app.config["MAX_FORM_MEMORY_SIZE"]  # type: ignore[no-any-return]
+
+    @max_form_memory_size.setter
+    def max_form_memory_size(self, value: int | None) -> None:
+        self._max_form_memory_size = value
+
+    @property  # type: ignore[override]
+    def max_form_parts(self) -> int | None:
+        """The maximum number of fields that may be present in a
+        ``multipart/form-data`` body. If this limit is exceeded, a 413
+        :exc:`~werkzeug.exceptions.RequestEntityTooLarge` error is raised. If it
+        is set to ``None``, no limit is enforced at the Flask application level.
+
+        Each request defaults to the :data:`MAX_FORM_PARTS` config, which
+        defaults to ``1_000``. It can be set on a specific ``request`` to apply
+        the limit to that specific view. This should be set appropriately based
+        on an application's or view's specific needs.
+
+        .. versionchanged:: 3.1
+            This is configurable through Flask config.
+        """
+        if self._max_form_parts is not None:
+            return self._max_form_parts
+
+        if not current_app:
+            return super().max_form_parts
+
+        return current_app.config["MAX_FORM_PARTS"]  # type: ignore[no-any-return]
+
+    @max_form_parts.setter
+    def max_form_parts(self, value: int | None) -> None:
+        self._max_form_parts = value
+
+    @property
+    def endpoint(self) -> str | None:
+        """The endpoint that matched the request URL.
+
+        This will be ``None`` if matching failed or has not been
+        performed yet.
+
+        This in combination with :attr:`view_args` can be used to
+        reconstruct the same URL or a modified URL.
+        """
+        if self.url_rule is not None:
+            return self.url_rule.endpoint  # type: ignore[no-any-return]
+
+        return None
+
+    @property
+    def blueprint(self) -> str | None:
+        """The registered name of the current blueprint.
+
+        This will be ``None`` if the endpoint is not part of a
+        blueprint, or if URL matching failed or has not been performed
+        yet.
+
+        This does not necessarily match the name the blueprint was
+        created with. It may have been nested, or registered with a
+        different name.
+        """
+        endpoint = self.endpoint
+
+        if endpoint is not None and "." in endpoint:
+            return endpoint.rpartition(".")[0]
+
+        return None
+
+    @property
+    def blueprints(self) -> list[str]:
+        """The registered names of the current blueprint upwards through
+        parent blueprints.
+
+        This will be an empty list if there is no current blueprint, or
+        if URL matching failed.
+
+        .. versionadded:: 2.0.1
+        """
+        name = self.blueprint
+
+        if name is None:
+            return []
+
+        return _split_blueprint_path(name)
+
+    def _load_form_data(self) -> None:
+        super()._load_form_data()
+
+        # In debug mode we're replacing the files multidict with an ad-hoc
+        # subclass that raises a different error for key errors.
+        if (
+            current_app
+            and current_app.debug
+            and self.mimetype != "multipart/form-data"
+            and not self.files
+        ):
+            from .debughelpers import attach_enctype_error_multidict
+
+            attach_enctype_error_multidict(self)
+
+    def on_json_loading_failed(self, e: ValueError | None) -> t.Any:
+        try:
+            return super().on_json_loading_failed(e)
+        except BadRequest as ebr:
+            if current_app and current_app.debug:
+                raise
+
+            raise BadRequest() from ebr
+
+
+class Response(ResponseBase):
+    """The response object that is used by default in Flask.  Works like the
+    response object from Werkzeug but is set to have an HTML mimetype by
+    default.  Quite often you don't have to create this object yourself because
+    :meth:`~flask.Flask.make_response` will take care of that for you.
+
+    If you want to replace the response object used you can subclass this and
+    set :attr:`~flask.Flask.response_class` to your subclass.
+
+    .. versionchanged:: 1.0
+        JSON support is added to the response, like the request. This is useful
+        when testing to get the test client response data as JSON.
+
+    .. versionchanged:: 1.0
+
+        Added :attr:`max_cookie_size`.
+    """
+
+    default_mimetype: str | None = "text/html"
+
+    json_module = json
+
+    autocorrect_location_header = False
+
+    @property
+    def max_cookie_size(self) -> int:  # type: ignore
+        """Read-only view of the :data:`MAX_COOKIE_SIZE` config key.
+
+        See :attr:`~werkzeug.wrappers.Response.max_cookie_size` in
+        Werkzeug's docs.
+        """
+        if current_app:
+            return current_app.config["MAX_COOKIE_SIZE"]  # type: ignore[no-any-return]
+
+        # return Werkzeug's default when not in an app context
+        return super().max_cookie_size
+
+from __future__ import annotations
+
+import dataclasses
+import decimal
+import json
+import typing as t
+import uuid
+import weakref
+from datetime import date
+
+from werkzeug.http import http_date
+
+if t.TYPE_CHECKING:  # pragma: no cover
+    from werkzeug.sansio.response import Response
+
+    from ..sansio.app import App
+
+
+class JSONProvider:
+    """A standard set of JSON operations for an application. Subclasses
+    of this can be used to customize JSON behavior or use different
+    JSON libraries.
+
+    To implement a provider for a specific library, subclass this base
+    class and implement at least :meth:`dumps` and :meth:`loads`. All
+    other methods have default implementations.
+
+    To use a different provider, either subclass ``Flask`` and set
+    :attr:`~flask.Flask.json_provider_class` to a provider class, or set
+    :attr:`app.json <flask.Flask.json>` to an instance of the class.
+
+    :param app: An application instance. This will be stored as a
+        :class:`weakref.proxy` on the :attr:`_app` attribute.
+
+    .. versionadded:: 2.2
+    """
+
+    def __init__(self, app: App) -> None:
+        self._app: App = weakref.proxy(app)
+
+    def dumps(self, obj: t.Any, **kwargs: t.Any) -> str:
+        """Serialize data as JSON.
+
+        :param obj: The data to serialize.
+        :param kwargs: May be passed to the underlying JSON library.
+        """
+        raise NotImplementedError
+
+    def dump(self, obj: t.Any, fp: t.IO[str], **kwargs: t.Any) -> None:
+        """Serialize data as JSON and write to a file.
+
+        :param obj: The data to serialize.
+        :param fp: A file opened for writing text. Should use the UTF-8
+            encoding to be valid JSON.
+        :param kwargs: May be passed to the underlying JSON library.
+        """
+        fp.write(self.dumps(obj, **kwargs))
+
+    def loads(self, s: str | bytes, **kwargs: t.Any) -> t.Any:
+        """Deserialize data as JSON.
+
+        :param s: Text or UTF-8 bytes.
+        :param kwargs: May be passed to the underlying JSON library.
+        """
+        raise NotImplementedError
+
+    def load(self, fp: t.IO[t.AnyStr], **kwargs: t.Any) -> t.Any:
+        """Deserialize data as JSON read from a file.
+
+        :param fp: A file opened for reading text or UTF-8 bytes.
+        :param kwargs: May be passed to the underlying JSON library.
+        """
+        return self.loads(fp.read(), **kwargs)
+
+    def _prepare_response_obj(
+        self, args: tuple[t.Any, ...], kwargs: dict[str, t.Any]
+    ) -> t.Any:
+        if args and kwargs:
+            raise TypeError("app.json.response() takes either args or kwargs, not both")
+
+        if not args and not kwargs:
+            return None
+
+        if len(args) == 1:
+            return args[0]
+
+        return args or kwargs
+
+    def response(self, *args: t.Any, **kwargs: t.Any) -> Response:
+        """Serialize the given arguments as JSON, and return a
+        :class:`~flask.Response` object with the ``application/json``
+        mimetype.
+
+        The :func:`~flask.json.jsonify` function calls this method for
+        the current application.
+
+        Either positional or keyword arguments can be given, not both.
+        If no arguments are given, ``None`` is serialized.
+
+        :param args: A single value to serialize, or multiple values to
+            treat as a list to serialize.
+        :param kwargs: Treat as a dict to serialize.
+        """
+        obj = self._prepare_response_obj(args, kwargs)
+        return self._app.response_class(self.dumps(obj), mimetype="application/json")
+
+
+def _default(o: t.Any) -> t.Any:
+    if isinstance(o, date):
+        return http_date(o)
+
+    if isinstance(o, (decimal.Decimal, uuid.UUID)):
+        return str(o)
+
+    if dataclasses and dataclasses.is_dataclass(o):
+        return dataclasses.asdict(o)  # type: ignore[arg-type]
+
+    if hasattr(o, "__html__"):
+        return str(o.__html__())
+
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
+class DefaultJSONProvider(JSONProvider):
+    """Provide JSON operations using Python's built-in :mod:`json`
+    library. Serializes the following additional data types:
+
+    -   :class:`datetime.datetime` and :class:`datetime.date` are
+        serialized to :rfc:`822` strings. This is the same as the HTTP
+        date format.
+    -   :class:`uuid.UUID` is serialized to a string.
+    -   :class:`dataclasses.dataclass` is passed to
+        :func:`dataclasses.asdict`.
+    -   :class:`~markupsafe.Markup` (or any object with a ``__html__``
+        method) will call the ``__html__`` method to get a string.
+    """
+
+    default: t.Callable[[t.Any], t.Any] = staticmethod(_default)
+    """Apply this function to any object that :meth:`json.dumps` does
+    not know how to serialize. It should return a valid JSON type or
+    raise a ``TypeError``.
+    """
+
+    ensure_ascii = True
+    """Replace non-ASCII characters with escape sequences. This may be
+    more compatible with some clients, but can be disabled for better
+    performance and size.
+    """
+
+    sort_keys = True
+    """Sort the keys in any serialized dicts. This may be useful for
+    some caching situations, but can be disabled for better performance.
+    When enabled, keys must all be strings, they are not converted
+    before sorting.
+    """
+
+    compact: bool | None = None
+    """If ``True``, or ``None`` out of debug mode, the :meth:`response`
+    output will not add indentation, newlines, or spaces. If ``False``,
+    or ``None`` in debug mode, it will use a non-compact representation.
+    """
+
+    mimetype = "application/json"
+    """The mimetype set in :meth:`response`."""
+
+    def dumps(self, obj: t.Any, **kwargs: t.Any) -> str:
+        """Serialize data as JSON to a string.
+
+        Keyword arguments are passed to :func:`json.dumps`. Sets some
+        parameter defaults from the :attr:`default`,
+        :attr:`ensure_ascii`, and :attr:`sort_keys` attributes.
+
+        :param obj: The data to serialize.
+        :param kwargs: Passed to :func:`json.dumps`.
+        """
+        kwargs.setdefault("default", self.default)
+        kwargs.setdefault("ensure_ascii", self.ensure_ascii)
+        kwargs.setdefault("sort_keys", self.sort_keys)
+        return json.dumps(obj, **kwargs)
+
+    def loads(self, s: str | bytes, **kwargs: t.Any) -> t.Any:
+        """Deserialize data as JSON from a string or bytes.
+
+        :param s: Text or UTF-8 bytes.
+        :param kwargs: Passed to :func:`json.loads`.
+        """
+        return json.loads(s, **kwargs)
+
+    def response(self, *args: t.Any, **kwargs: t.Any) -> Response:
+        """Serialize the given arguments as JSON, and return a
+        :class:`~flask.Response` object with it. The response mimetype
+        will be "application/json" and can be changed with
+        :attr:`mimetype`.
+
+        If :attr:`compact` is ``False`` or debug mode is enabled, the
+        output will be formatted to be easier to read.
+
+        Either positional or keyword arguments can be given, not both.
+        If no arguments are given, ``None`` is serialized.
+
+        :param args: A single value to serialize, or multiple values to
+            treat as a list to serialize.
+        :param kwargs: Treat as a dict to serialize.
+        """
+        obj = self._prepare_response_obj(args, kwargs)
+        dump_args: dict[str, t.Any] = {}
+
+        if (self.compact is None and self._app.debug) or self.compact is False:
+            dump_args.setdefault("indent", 2)
+        else:
+            dump_args.setdefault("separators", (",", ":"))
+
+        return self._app.response_class(
+            f"{self.dumps(obj, **dump_args)}\n", mimetype=self.mimetype
+        )
