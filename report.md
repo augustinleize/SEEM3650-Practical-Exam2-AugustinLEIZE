@@ -9,3 +9,15 @@ The us crock. What that a enaw crown.
 
 GREMIO:
 Go must of the of it heart milend like eart well.
+
+## Task 3: Model Architecture Exploration
+
+### Validation Loss Comparison
+According to my student ID remainder (Remainder 1), I fixed the number of attention heads to 5 and varied the number of layers to observe the impact on performance.
+
+| Number of Layers (`n_layer`) | Final Validation Loss (at step 500) |
+| :--- | :--- |
+| 2 | 1.8393 |
+| 3 |  |
+| 5 |  |
+| 7 |  |
